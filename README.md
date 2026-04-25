@@ -33,6 +33,26 @@ This utility supports proxies. You can use a proxy hosting service and **ProxiFy
 
 ---
 
+## 🧑‍💻 Custom commands
+
+`c_input <action> <time>`:
+action - hook, fire, left, right, jump; 
+time - time in ms
+
+`c_stop`:
+stops c_input
+
+`c_aim <dx> <dy>`:
+shifts the sight coordinates by dx, dy
+
+`c_oaim <x> <y>`:
+sets the sight coordinates to x, y
+
+`c_sleep`/`c_wake`:
+makes a VERY slow render
+
+---
+
 ## ❓ Frequently Asked Questions (FAQ)
 
 **Q: ProxiFyre starts with logs beginning with "? .... "**
@@ -56,4 +76,4 @@ A2: Make sure that you have 1 Python installed, and you run through `C:/Windows/
 
 ---
 
-**Enjoy!**
+**Enjoy! =D**
