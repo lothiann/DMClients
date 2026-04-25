@@ -1,6 +1,6 @@
 # DMClients
 
-**DMClients (DDNet Multi Clients)** is a Python utility for managing a large number of DDNet game clients.
+**DMClients (DDNet Multi Clients)** - Python utility for managing a large number of DDNet game clients.
 
 [![TikTok](https://img.shields.io/badge/TikTok-@DMClients-000000?style=for-the-sauce&logo=tiktok)](https://tiktok.com/@DMClients)
 [![Telegram](https://img.shields.io/badge/Telegram-@DMClients-26A5E4?style=for-the-sauce&logo=telegram)](https://t.me/DMClients)
