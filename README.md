@@ -53,6 +53,22 @@ makes a VERY slow render
 
 ---
 
+## Third-party components
+
+### Xray-core (xray.exe)
+- **Project:** https://github.com/XTLS/Xray-core
+- **License:** MPL-2.0
+- **Binary version:** v26.3.27
+- **SHA256:** `15C2D007954AC53BA69B80EC91242786B3C0B71D52649165B4CA1D5CC96EF8F1`
+
+### ProxiFyre
+- **Project:** https://github.com/username/ProxiFyre
+- **License:** AGPL-3.0
+- **Binary version:** v2.2.0
+- **SHA256:** `0CF61A431D02711DDD7F3D5DCA545DF8CE5F4B808AB34B713978AC272E1719D9`
+
+---
+
 ## ❓ Frequently Asked Questions (FAQ)
 
 **Q: ProxiFyre starts with logs beginning with "? .... "**
