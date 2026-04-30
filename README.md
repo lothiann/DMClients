@@ -7,24 +7,6 @@
 
 ---
 
-## 📦 Installation
-
-To run the script, you need to install the required Python libraries.
-
-**Core Libraries (Required):**
-
-```bash
-pip install requests PySocks rich python-v2ray
-```
-
-**UI Libraries (Required only if you plan to use the graphical interface):**
-
-```bash
-pip install flet psutil
-```
-
----
-
 ## 🌐 Bypassing Bans
 
 This utility supports proxies. You can use a proxy hosting service and **ProxiFyre** to bypass IP bans and connection limits.
