@@ -33,6 +33,20 @@ sets the sight coordinates to x, y
 `c_sleep`/`c_wake`:
 makes a VERY slow render
 
+## 🖋️ Placeholders
+
+`{i}` - customer number (1..N)
+
+`{r}` - random character (a-z, A-Z, 0-9, _, ., -)
+
+`{ri-N}` is a random number from 0 to N (for example {ri-100})
+
+`{n}` is a random nickname from names.json
+
+`{d}` is a random phrase from the dictionary.json
+
+`{c}` - random Chinese character (Unicode 4E00–9FFF)
+
 ---
 
 ## Third-party components
