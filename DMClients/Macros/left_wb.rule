@@ -1,0 +1,17 @@
+send("kill")
+sleep(100)
+
+# Anti zero coordinates
+while pos.x() == 0.0 and pos.y() == 0.0:
+    sleep(50)
+
+log(f"[Client {client_id}] Moved ({pos.x()},{pos.y()})")
+log(f"[Client {client_id}] Condition: pos.x={pos.x()} < 3700 = {pos.x() < 3700}")
+
+sleep(20)
+if pos.x() < 3700:
+    log(f"[Client {client_id}] Playing LEFT ({pos.x()})")
+    macros.play("11.inp")
+else:
+    log(f"[Client {client_id}] Playing RIGHT ({pos.x()})")
+    macros.play("12.inp")

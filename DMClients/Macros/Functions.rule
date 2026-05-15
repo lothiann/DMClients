@@ -1,0 +1,93 @@
+# Example rule script
+
+# *pid - Player ID (optional, defaults to current client's local_id)
+# cid - Client ID (current client available as 'client_id')
+# cmd - Command
+# msg - Message
+# ms - Milliseconds
+
+# client_id              - Current client ID
+# name(*pid)             — Player name by player ID
+# pos.x(*pid)            — X coordinate of player
+# pos.y(*pid)            — Y coordinate of player
+# weapon(*pid)           — Weapon ID (0-5)
+# health(*pid)           — Health points
+# armor(*pid)            — Armor points
+# frozen(*pid)           — True if frozen
+# team(*pid)             — Team ID
+# type(*pid)             — "bot" or "player"
+# dir(*pid)              — Direction (1 = right, -1 = left)
+# jump(*pid)             — Jump state
+# hook(*pid)             — Hook state
+# angle(*pid)            — Player angle
+# attack(*pid)           — Attack tick
+# aim.x(*pid)            — X coordinate of player aim
+# aim.y(*pid)            — Y coordinate of player aim
+# local_id(cid)          — Player ID of client (by client ID), without arg returns for current client
+# get_log(cid)           — Last log line of client (by client ID)
+# send(cmd)              — Send command to current client
+# send_to(cid, cmd)      — Send command to specific client (by client ID)
+# get_clients()          — List of all online client IDs
+# get_selected()         — List of selected (checked) client IDs
+# log(msg)               — Print message to UI console
+# sleep(ms)              — Pause in milliseconds
+# running()              — True while script is not stopped
+# server_name()          — Current server name
+# server_map()           — Current map name
+# server_gametype()      — Current gametype
+# server_players()       — Current player count
+# server_max_players()   — Max players on server
+# launch_client(cid)     — Launch client process
+# stop_client(cid)       — Stop client process
+# client_running(cid)    — Check if client is running
+# macros.play("file")    — Start .inp macro during rule (relative to Macros folder)
+
+# 1. Bot info
+my_id = local_id()
+bot_name = name(my_id) if my_id else "Unknown"
+log(f"Bot Name: {bot_name}")
+log(f"Local ID: {my_id}")
+
+# 2. Coordinates
+for cid in get_selected():
+    pid = local_id(cid)
+    if pid:
+        x = pos.x(pid)
+        y = pos.y(pid)
+        log(f"Client #{cid} (PID {pid}): x={x:.0f}, y={y:.0f}")
+    else:
+        log(f"Client #{cid}: no player found")
+
+# 3. Online clients
+online = get_clients()
+log(f"Online clients: {online}")
+
+# 4. Selected clients
+selected = get_selected()
+log(f"Selected clients: {selected}")
+
+# 5. Server info
+log(f"Server: {server_name()}")
+log(f"Map: {server_map()}")
+log(f"Gametype: {server_gametype()}")
+log(f"Players: {server_players()}/{server_max_players()}")
+
+# 6. Last log
+last_log = get_log(1)
+log(f"Last log (Client #1): {last_log[:100] if last_log else 'None'}")
+
+# 7. All players on server
+players = app.bridge_receiver.get_all_players()
+log(f"Players on server: {len(players)}")
+for pid, p in list(players.items())[:5]:
+    log(f"  ID={pid}: {p.get('name', '?')}")
+
+# 8. Block status
+log(f"Block enabled: {app.attack_enable_switch.value}")
+
+# 9. Client running status
+for cid in get_clients()[:5]:
+    log(f"Client #{cid} running: {client_running(cid)}")
+
+# 10. Example: start macro during rule
+# macros.play("example.inp")

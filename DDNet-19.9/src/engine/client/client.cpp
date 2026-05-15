@@ -2730,20 +2730,17 @@ void CClient::UpdateDemoIntraTimers()
 
 void CClient::Update()
 {
-	// Проверка sleep
 	static bool s_SleepInit = false;
-	if(!s_SleepInit && m_pConsole) // Используем m_pConsole - он в CClient есть!
+	if(!s_SleepInit && m_pConsole)
 	{
 		m_SleepMode.m_pConsole = m_pConsole;
 		m_SleepMode.OnInit();
 		s_SleepInit = true;
 	}
 
-	// --- ОБНОВЛЕНИЕ БОТА ---
 	m_BotNet.m_pGameChild = (CGameClient *)GameClient(); 
 	m_BotNet.OnTick();
 	m_pBotControl->OnTick();
-	// -----------------------
 
 	PumpNetwork();
 
@@ -3257,7 +3254,7 @@ void CClient::Run()
 	auto LastTime = time_get_nanoseconds();
 	int64_t LastRenderTime = time_get();
 
-    m_Bridge.Init(GameClient(), this);
+    m_Bridge.Init(GameClient(), this, m_pConsole);
 
 	while(true)
 	{
@@ -4528,11 +4525,9 @@ void CClient::RegisterCommands()
 {
 	m_pConsole = Kernel()->RequestInterface<IConsole>();
 
-	// --- ИНИЦИАЛИЗАЦИЯ БОТА ---
 	m_pBotControl->m_pConsole = m_pConsole;
 	m_pBotControl->OnInit();
 	m_BotNet.Init(this, m_pBotControl, m_pConsole, GameClient());
-	// --------------------------
 
 	m_pConsole->Register("dummy_connect", "", CFGFLAG_CLIENT, Con_DummyConnect, this, "Connect dummy");
 	m_pConsole->Register("dummy_disconnect", "", CFGFLAG_CLIENT, Con_DummyDisconnect, this, "Disconnect dummy");

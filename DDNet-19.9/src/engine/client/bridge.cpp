@@ -4,7 +4,11 @@
 #include <engine/console.h>
 
 #include <game/client/gameclient.h>
-#include <base/time.h> // Нужно для time_get() и time_freq()
+#include <base/time.h>
+
+#include <random>
+#include <sstream>
+#include <iomanip>
 
 #if defined(CONF_FAMILY_WINDOWS)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -19,10 +23,35 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h> // Нужно для TCP_NODELAY (Linux/Mac)
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
+
+static std::string GenerateToken()
+{
+	static std::random_device rd;
+	static std::mt19937 gen(rd());
+	static std::uniform_int_distribution<> dis(0, 15);
+	std::stringstream ss;
+	ss << std::hex;
+	for(int i = 0; i < 16; i++)
+		ss << std::setw(2) << std::setfill('0') << dis(gen);
+	return ss.str();
+}
+
+static void ConSync(IConsole::IResult *pResult, void *pUserData)
+{
+	CBridge *pBridge = (CBridge *)pUserData;
+	std::string newToken = GenerateToken();
+	std::string ctrl_msg = "TOKEN " + newToken + "\n";
+	send((SOCKET)pBridge->m_Socket, ctrl_msg.c_str(), (int)ctrl_msg.size(), 0);
+	if(pBridge->m_SendConnected)
+	{
+		std::string bridge_msg = "TOKEN " + newToken + "\n";
+		send((SOCKET)pBridge->m_SendSocket, bridge_msg.c_str(), (int)bridge_msg.size(), 0);
+	}
+}
 
 CBridge::CBridge() :
 	m_Socket((unsigned long long)-1),
@@ -51,11 +80,15 @@ CBridge::~CBridge()
 #endif
 }
 
-void CBridge::Init(IGameClient *pGameClient, IClient *pClient)
+void CBridge::Init(IGameClient *pGameClient, IClient *pClient, IConsole *pConsole)
 {
 	m_pGameClient = pGameClient;
 	m_pClient = pClient;
 	m_LastSendTime = time_get();
+
+	pConsole->Register("c_sync", "", CFGFLAG_CLIENT, ConSync, this, "Sync token with control server");
+
+	std::string token = GenerateToken();
 
 #if defined(CONF_FAMILY_WINDOWS)
 	WSADATA wsaData;
@@ -63,9 +96,8 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient)
 		return;
 #endif
 
-	int flag = 1; // Для TCP_NODELAY
+	int flag = 1;
 
-	// ---------- Сокет для приёма команд (порт 5555) ----------
 #if defined(CONF_FAMILY_WINDOWS)
 	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #else
@@ -87,10 +119,7 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient)
 	else
 	{
 		m_Connected = true;
-		
-		// Отключаем буферизацию (пакеты улетают сразу)
 		setsockopt((SOCKET)m_Socket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-		
 #if defined(CONF_FAMILY_WINDOWS)
 		unsigned long mode = 1;
 		ioctlsocket((SOCKET)m_Socket, FIONBIO, &mode);
@@ -98,9 +127,14 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient)
 		int flags = fcntl((int)m_Socket, F_GETFL, 0);
 		fcntl((int)m_Socket, F_SETFL, flags | O_NONBLOCK);
 #endif
+
+#if defined(CONF_FAMILY_WINDOWS)
+		Sleep(3500);
+#endif
+		std::string ctrl_msg = "TOKEN " + token + "\n";
+		send((SOCKET)m_Socket, ctrl_msg.c_str(), (int)ctrl_msg.size(), 0);
 	}
 
-	// ---------- Сокет для отправки данных (порт 5556) ----------
 #if defined(CONF_FAMILY_WINDOWS)
 	SOCKET send_s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 #else
@@ -126,10 +160,9 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient)
 	else
 	{
 		m_SendConnected = true;
-		
-		// Отключаем буферизацию
 		setsockopt((SOCKET)m_SendSocket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-
+		int sndbuf = 256 * 1024;
+		setsockopt((SOCKET)m_SendSocket, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
 #if defined(CONF_FAMILY_WINDOWS)
 		unsigned long mode = 1;
 		ioctlsocket((SOCKET)m_SendSocket, FIONBIO, &mode);
@@ -137,7 +170,8 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient)
 		int flags = fcntl((int)m_SendSocket, F_GETFL, 0);
 		fcntl((int)m_SendSocket, F_SETFL, flags | O_NONBLOCK);
 #endif
-		dbg_msg("bridge", "connected to send port 5556");
+		std::string bridge_msg = "TOKEN " + token + "\n";
+		send((SOCKET)m_SendSocket, bridge_msg.c_str(), (int)bridge_msg.size(), 0);
 	}
 }
 
@@ -146,9 +180,8 @@ void CBridge::SendGameState()
 	if(!m_pGameClient || !m_SendConnected || !m_pClient)
 		return;
 
-	// Ограничение: 50 обновлений в секунду (тикрейт сервера DDNet)
 	int64_t Now = time_get();
-	if(Now - m_LastSendTime < time_freq() / 50)
+	if(Now - m_LastSendTime < time_freq() / 150)
 		return;
 	m_LastSendTime = Now;
 
@@ -160,7 +193,6 @@ void CBridge::SendGameState()
 	char aBuffer[32768];
 	int Len = 0;
 
-	// ---- 1. Серверная информация ----
 	CServerInfo ServerInfo;
 	m_pClient->GetServerInfo(&ServerInfo);
 	Len += str_format(aBuffer + Len, sizeof(aBuffer) - Len,
@@ -171,7 +203,6 @@ void CBridge::SendGameState()
 		ServerInfo.m_NumPlayers,
 		ServerInfo.m_MaxPlayers);
 
-	// ---- 2. Данные игроков + состояние ----
 	for(int i = 0; i < MAX_CLIENTS; ++i)
 	{
 		const CGameClient::CClientData &Client = pGameClient->m_aClients[i];
@@ -245,7 +276,6 @@ void CBridge::SendGameState()
 	if(Len == 0)
 		return;
 
-	// ---- 3. Отправка пакета ----
 	int sent = send((SOCKET)m_SendSocket, aBuffer, Len, 0);
 	if(sent < 0)
 	{
@@ -272,10 +302,7 @@ void CBridge::Update(IConsole *pConsole)
 		if(nBytes > 0)
 		{
 			aBuf[nBytes] = '\0';
-			
-			// Добавляем входящие данные в буфер и разбиваем по символу \n
 			m_CommandBuffer += aBuf;
-
 			size_t pos;
 			while((pos = m_CommandBuffer.find('\n')) != std::string::npos)
 			{

@@ -1,0 +1,49 @@
+aim -378 -129
+input weapon 1
+sleep 200
+aim -378 -127
+sleep 120
+input left 1
+aim -372 -145
+sleep 80
+aim -352 -188
+sleep 40
+aim -327 -229
+sleep 80
+aim -320 -239
+sleep 40
+aim -313 -247
+sleep 40
+input hook 1
+aim -311 -250
+sleep 120
+input hook 0
+sleep 40
+aim -339 -202
+sleep 40
+aim -380 -123
+sleep 40
+aim -398 -28
+sleep 80
+aim -399 19
+sleep 40
+aim -398 29
+sleep 40
+aim -398 35
+sleep 120
+input hook 1
+sleep 440
+input left 0
+input hook 0
+sleep 120
+input left 1
+sleep 280
+input left 0
+sleep 3720
+aim -380 23
+sleep 80
+aim -364 7
+sleep 40
+aim -350 -6
+sleep 40
+aim -348 -8
