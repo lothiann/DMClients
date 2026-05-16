@@ -36,6 +36,14 @@ def patch_script(src, dst):
         '[sys.executable, "-u", ports_script]',
         '[ports_script]'
     )
+    c = c.replace(
+        'sys.stdout.flush()',
+        'if sys.stdout is not None: sys.stdout.flush()'
+    )
+    c = c.replace(
+        'sys.stderr.flush()',
+        'if sys.stderr is not None: sys.stderr.flush()'
+    )
     with open(dst, 'w', encoding='utf-8') as f:
         f.write(c)
 
@@ -63,7 +71,7 @@ def main():
     for name in ['ports_proxies.py', 'optimal_proxies_new.py']:
         src = os.path.join(BASE_DIR, name)
         if os.path.exists(src):
-            shutil.copy(src, os.path.join(temp_dir, name))
+            patch_script(src, os.path.join(temp_dir, name))
 
     scripts = {
         'UI':           ui_dst,

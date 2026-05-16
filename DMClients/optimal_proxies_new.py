@@ -16,6 +16,11 @@ from rich.live import Live
 from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn
 from rich.console import Console
 
+if sys.stdout is not None and hasattr(sys.stdout, 'buffer') and sys.stdout.buffer is not None:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if sys.stderr is not None and hasattr(sys.stderr, 'buffer') and sys.stderr.buffer is not None:
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 # --- Настройки ---
 XRAY_PATH = "xray.exe"
 TEST_URL = "http://ifconfig.me/ip"
@@ -70,9 +75,6 @@ console = Console()
 SPARE_COUNT = 5
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SPARE_FILE = os.path.join(SCRIPT_DIR, "Settings", "spare_proxies.json")
-
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 def kill_all():
     for proc in ["xray.exe", "proxifyre.exe", "hddnet1.exe"]:

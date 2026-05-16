@@ -6,7 +6,13 @@ import time
 import threading
 import requests
 import socket
+import io
 from python_v2ray.config_parser import parse_uri
+
+if sys.stdout is not None and hasattr(sys.stdout, 'buffer') and sys.stdout.buffer is not None:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if sys.stderr is not None and hasattr(sys.stderr, 'buffer') and sys.stderr.buffer is not None:
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 PROXIES = []
 if os.path.exists(proxies_path := os.path.join(os.path.dirname(os.path.abspath(__file__)), "Settings", "proxies.json")):
