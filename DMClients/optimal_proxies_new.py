@@ -17,7 +17,8 @@ from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn
 from rich.console import Console
 
 if getattr(sys, 'frozen', False):
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8')
 
 # --- Настройки ---
 XRAY_PATH = "xray.exe"

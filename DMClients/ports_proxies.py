@@ -10,7 +10,8 @@ import io
 from python_v2ray.config_parser import parse_uri
 
 if getattr(sys, 'frozen', False):
-    sys.stdout.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
+    sys.stderr.reconfigure(encoding='utf-8')
 
 PROXIES = []
 if os.path.exists(proxies_path := os.path.join(os.path.dirname(os.path.abspath(__file__)), "Settings", "proxies.json")):
