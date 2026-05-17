@@ -21,6 +21,18 @@ def patch_script(src, dst):
         'os.path.dirname(sys.executable)'
     )
     c = c.replace(
+        'os.path.dirname(os.path.dirname(__file__))',
+        'os.path.dirname(os.path.dirname(sys.executable))'
+    )
+    c = c.replace(
+        'os.path.dirname(os.path.abspath(__file__))',
+        'os.path.dirname(sys.executable)'
+    )
+    c = c.replace(
+        'os.path.join(os.path.dirname(__file__)',
+        'os.path.join(os.path.dirname(sys.executable))'
+    )
+    c = c.replace(
         'optimal_proxies_new.py',
         'optimal_proxies_new.exe'
     )
@@ -128,7 +140,7 @@ for exe_name, script_path in scripts.items():
         bootloader_ignore_signals=False,
         strip=False,
         upx=True,
-        console=False,
+        console=exe_name != 'UI',
     )
     compiled_apps.extend([a.binaries, a.datas, exe])
 

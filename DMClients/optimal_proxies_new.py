@@ -16,10 +16,8 @@ from rich.live import Live
 from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn
 from rich.console import Console
 
-if sys.stdout is not None and hasattr(sys.stdout, 'buffer') and sys.stdout.buffer is not None:
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-if sys.stderr is not None and hasattr(sys.stderr, 'buffer') and sys.stderr.buffer is not None:
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+if getattr(sys, 'frozen', False):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # --- Настройки ---
 XRAY_PATH = "xray.exe"
