@@ -281,7 +281,7 @@ Live overview of all players currently visible to the bridge.
 | Player | Name (truncated to 20 chars) |
 | ID | In-game player ID |
 | Pos X / Y | World coordinates |
-| Weapon | Weapon name + ID |
+| Weapon | Weapon name (ID) |
 | Health | Current HP |
 | Frozen | True / False |
 | Type | `Bot` (your client) or `Player` (other) |
