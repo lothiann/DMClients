@@ -180,21 +180,21 @@ A Python script executed per-client with access to game state. Each client runs 
 | Name | Type | Description |
 |------|------|-------------|
 | `client_id` | `int` | Control server ID of the current client |
-| `pos.x()` / `pos.y()` | `float` | Current player world position |
-| `aim.x()` / `aim.y()` | `int` | Current aim target coordinates |
-| `weapon()` | `int` | Current weapon (0=Hammer … 5=Ninja) |
-| `health()` | `int` | Current HP |
-| `armor()` | `int` | Current armor |
-| `frozen()` | `bool` | Whether the player is frozen |
-| `team()` | `int` | Current team |
-| `dir()` | `int` | Movement direction |
-| `jump()` | `int` | Jump state |
-| `hook()` | `int` | Hook state |
-| `angle()` | `int` | Aim angle |
-| `attack()` | `int` | Attack tick |
-| `name()` | `str` | Player name |
+| `pos.x(*pid)` / `pos.y()` | `float` | Current player world position |
+| `aim.x(*pid)` / `aim.y()` | `int` | Current aim target coordinates |
+| `weapon(*pid)` | `int` | Current weapon (0=Hammer … 5=Ninja) |
+| `health(*pid)` | `int` | Current HP |
+| `armor(*pid)` | `int` | Current armor |
+| `frozen(*pid)` | `bool` | Whether the player is frozen |
+| `team(*pid)` | `int` | Current team |
+| `dir(*pid)` | `int` | Movement direction |
+| `jump(*pid)` | `int` | Jump state |
+| `hook(*pid)` | `int` | Hook state |
+| `angle(*pid)` | `int` | Aim angle |
+| `attack(*pid)` | `int` | Attack tick |
+| `name(*pid)` | `str` | Player name |
 | `local_id()` | `int` | In-game player ID of this client |
-| `type()` | `str` | `'player'` or `'bot'` |
+| `type(*pid)` | `str` | `'player'` or `'bot'` |
 | `running()` | `bool` | Whether the macro is still active |
 | `send(cmd)` | func | Send a command to this client |
 | `send_to(cid, cmd)` | func | Send a command to a specific control client |
@@ -292,7 +292,7 @@ Live overview of all players currently visible to the bridge.
 | Attack | Attack tick |
 | Aim | Target X, Y |
 
-> **Note:** All coordinate types are given in units (to get tile coordinates, divide the coordinates by 32)
+> **Note:** All coordinate types are given in units (to get tile coordinates, divide the coordinates by 32).
 
 ---
 
@@ -302,7 +302,7 @@ Browse and connect to DDNet servers fetched from the official master servers.
 - **Refresh** — fetches servers from all 4 DDNet masters, picks the fastest one, and loads all servers in chunks
 - **Sort ↕** — toggles sort by player count (descending / ascending)
 - **Hide full** — hides servers where `players >= max_players`
-- **Community filter** — filter by community (DDNet, KoG, Blockworlds, etc.)
+- **Community filter** — filter by community (DDRaceNetwork, KoG, Blockworlds, etc.)
 - Each row has a **Connect** button that sends `connect <ip:port>` to selected clients
 
 #### Server Hop
@@ -346,7 +346,7 @@ Automatically cycles through servers at a set interval.
 
 #### Client count
 - **Clients** — total number of client instances (`HDDNet1.exe` … `HDDNetN.exe`)
-- **Clients per proxy** — how many clients share one proxy port
+- **Clients per proxy** — how many clients share one proxy
 - **Apply** — copies `HDDNet1.exe` for the new count, regenerates `ProxiFyre/app-config.json`
 
 #### Proxies table
