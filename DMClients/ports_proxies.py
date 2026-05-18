@@ -19,11 +19,22 @@ if os.path.exists(proxies_path := os.path.join(os.path.dirname(os.path.abspath(_
         PROXIES = json.load(f)
 
 XRAY_PATH = "xray.exe"
-TEST_URL = "http://ifconfig.me/ip"
+TEST_URL = "https://www.google.com/generate_204"
 log_enabled = True
 
 processes = []
 process_lock = threading.Lock()
+
+if sys.platform == 'win32':
+    driver_path = r"C:\Windows\System32\drivers\ndisrd.sys"
+    if not os.path.exists(driver_path):
+        print("="*60)
+        print("⚠️  WARNING: ndisrd.sys driver not found!")
+        print("="*60)
+        print("This tool requires Windows Packet Filter driver")
+        print("Download: https://github.com/wiresock/ndisapi/releases/")
+        print("="*60)
+        time.sleep(3)
 
 def start_proxy(proxy_config):
     from python_v2ray.config_parser import parse_uri

@@ -22,7 +22,8 @@ if getattr(sys, 'frozen', False):
 
 # --- Настройки ---
 XRAY_PATH = "xray.exe"
-TEST_URL = "http://ifconfig.me/ip"
+TEST_URL = "https://www.google.com/generate_204"
+TEST_NTP = "pool.ntp.org"
 TOP_N = 14
 START_PORT = 19000
 TIMEOUT = 10
@@ -44,13 +45,18 @@ SUB_URLS = [
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt",
     "https://raw.githubusercontent.com/Ai123999/WhiteKeys/refs/heads/main/WhiteKeys",
     "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha-All-Type.txt",
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
 
     "https://tinyurl.com/SemqkaVLESS",
     "https://raw.githubusercontent.com/cinev505/VlessTrogan-vpn-key/refs/heads/main/WhiteList-VPN-Vless",
     "https://raw.githubusercontent.com/Reallyza/ReallyzaVpn/refs/heads/main/ALL%20CONF-WH%2BWIFI",
     "https://github.com/Reallyza/ReallyzaVpn/blob/main/ALL%20CONF-WH%2BWIFI",
     "https://raw.githubusercontent.com/v0id9/vpn-configs/refs/heads/main/vpn.txt"
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/vmess.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/vless.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/trojan.txt",
+    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/ss.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt",
+    "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/refs/heads/main/configs/all.txt",
 ]
 
 PROTOCOLS = ("vless://", "vmess://", "ss://", "trojan://", "hysteria://", "hysteria2://")
@@ -181,51 +187,51 @@ def test_proxy(key: str, port: int) -> float | None:
         "outbounds": [outbound]
     }
 
-    for attempt in range(2):
+    try:
+        with open(cfg_file, "w") as f:
+            json.dump(config, f)
+
+        proc = subprocess.Popen([XRAY_PATH, "-c", cfg_file],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
         try:
-            with open(cfg_file, "w") as f:
-                json.dump(config, f)
-
-            proc = subprocess.Popen([XRAY_PATH, "-c", cfg_file],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                    creationflags=subprocess.CREATE_NO_WINDOW)
-            try:
-                time.sleep(1)
-                proxies = {"http": f"socks5://127.0.0.1:{port}",
-                           "https": f"socks5://127.0.0.1:{port}"}
-                start = time.time()
-                r = requests.get(TEST_URL, proxies=proxies, timeout=TIMEOUT)
-                ping = (time.time() - start) * 1000
-                if r.status_code not in (200, 204):
-                    return None
-
-                s = pysocks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.set_proxy(pysocks.SOCKS5, "127.0.0.1", port)
-                s.settimeout(TIMEOUT)
-                s.sendto(b'\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x01\x00\x01',
-                         ("8.8.8.8", 53))
-                s.recv(512)
-                s.close()
-
-                return round(ping, 1)
-
-            except (requests.exceptions.Timeout,
-                    requests.exceptions.ConnectionError,
-                    socket.timeout) as e:
-                if attempt == 0:
-                    continue
-                else:
-                    return None
-            except Exception:
+            time.sleep(3)
+            proxies = {"http": f"socks5://127.0.0.1:{port}",
+                       "https": f"socks5://127.0.0.1:{port}"}
+            start = time.time()
+            r = requests.get(TEST_URL, proxies=proxies, timeout=TIMEOUT)
+            ping = (time.time() - start) * 1000
+            if r.status_code not in (200, 204):
                 return None
-            finally:
-                proc.terminate()
-                proc.wait()
-                if os.path.exists(cfg_file):
-                    os.remove(cfg_file)
 
+            s = pysocks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.set_proxy(pysocks.SOCKS5, "127.0.0.1", port)
+            s.settimeout(3)
+
+            # Формируем NTP пакет (клиентский запрос)
+            ntp_packet = bytearray(48)
+            ntp_packet[0] = 0x23  # LI=0, VN=4, Mode=3
+
+            s.sendto(bytes(ntp_packet), (TEST_NTP, 123))
+            s.recv(48)  # NTP ответ всегда 48 байт
+            s.close()
+
+            return round(ping, 1)
+
+        except (requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                socket.timeout):
+            return None
         except Exception:
             return None
+        finally:
+            proc.terminate()
+            proc.wait()
+            if os.path.exists(cfg_file):
+                os.remove(cfg_file)
+
+    except Exception:
+        return None
 
     return None
 
@@ -324,7 +330,7 @@ def handle_bridge():
             break
 
 def main():
-    global TARGET_SERVER, use_spare, spare_count
+    global TARGET_SERVER, use_spare, spare_count, TOP_N
     use_spare = False
     spare_count = SPARE_COUNT
     for arg in sys.argv:
@@ -337,6 +343,11 @@ def main():
                     spare_count = int(arg.split("=", 1)[1])
                 except:
                     pass
+        elif arg.startswith("--top-n="):
+            try:
+                TOP_N = int(arg.split("=", 1)[1])
+            except:
+                pass
 
     console.print(f"[cyan]📡 Using target server: {TARGET_SERVER}[/cyan]")
     sys.stdout.flush()

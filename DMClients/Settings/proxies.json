@@ -1,1 +1,26 @@
-[]
+[
+  {
+    "port": 10801,
+    "key": "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo3ZTczMWVjMy1mOGUxLTQzZjYtOTJjZi0zOTc4ZDE0NzA1YzQ=@r3mrcg007117fb8.cybervena.com:50099?"
+  },
+  {
+    "port": 10802,
+    "key": "ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTo3ZTczMWVjMy1mOGUxLTQzZjYtOTJjZi0zOTc4ZDE0NzA1YzQ=@r3mrcg001287h3p.cybervena.com:50099?"
+  },
+  {
+    "port": 10803,
+    "key": "vless://b6ce8a51-19b9-4979-91ba-b4298c26d5fc@89.208.231.52:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=chrome&pbk=mAu8QDi3pbmMCFg9kKC-ZBIHdtnXeCuZt3VnAw6vlH4&sid=ad7dab462a323acb&sni=max.ru&fm=%25257B%252522tcp%252522%25253A%25255B%25257B%252522settings%252522%25253A%25257B%252522delay%252522%25253A%25252210-20%252522%25252C%252522length%252522%25253A%25252250-100%252522%25252C%252522packets%252522%25253A%252522tlshello%252522%25257D%25252C%252522type%252522%25253A%252522fragment%252522%25257D%25255D%25257D&echfq=none&fragment=50-100%25252C10-20%25252Ctlshello%25252Cnull#t.me%2FNotorgames_0 - 56 %F0%9F%87%B7%F0%9F%87%BA"
+  },
+  {
+    "port": 10804,
+    "key": "vless://5f5114c6-ad1f-4e4a-baad-aacb4634f275@178.154.208.143:443?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&fp=qq&sni=api-maps.yandex.ru&pbk=su8tIyeRdTZZHPvZn1AjBZPCv0_FsI7msHP_s8x4Oj0&sid=c3be66103c6cba50#%F0%9F%87%B3%F0%9F%87%B1%20The%20Netherlands%20%E2%80%94%20%23245%20t.me%2Frjsxrd"
+  },
+  {
+    "port": 10805,
+    "key": "vless://c5a4adb3-5a17-0001-bd1d-7b8ef815b4e0@5.42.111.154:443?flow=xtls-rprx-vision&encryption=none&type=tcp&security=reality&fp=chrome&sni=ru8.aimodelhub.top&pbk=jwT3lcIzJQMjzBKRNsmyRGrgaa1qNfE7pQF_nAKu0GA&sid=a73cf719b624#%F0%9F%87%A8%F0%9F%87%AD%20Switzerland%20%E2%80%94%20%2344%20t.me%2Frjsxrd"
+  },
+  {
+    "port": 10806,
+    "key": "vless://c5a4adb3-5a17-0001-bd1d-7b8ef815b4e0@ru4.aimodelhub.top:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=ru4.aimodelhub.top&fp=chrome&pbk=jwT3lcIzJQMjzBKRNsmyRGrgaa1qNfE7pQF_nAKu0GA&sid=a73cf719b624&type=tcp&headerType=none#860ms Россия RU 🇷🇺 @vlesstrojan%20t.me%2Frjsxrd"
+  }
+]

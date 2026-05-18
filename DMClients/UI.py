@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 _global_names = []
 _global_dictionary = []
+_show_advanced_logs = False
 
 # ========== HELPER FUNCTIONS ==========
 class DotDict:
@@ -65,24 +66,64 @@ def replace_placeholders(cmd: str, client_index: int) -> str:
         cmd = cmd.replace("{c}", ch, 1)
     return cmd
 
+# ========== BRIDGE PROTOCOL ==========
+class BridgeProtocol(asyncio.Protocol):
+    def __init__(self, receiver):
+        self.receiver = receiver
+        self.transport = None
+        self.buffer = ""
+        self.client_idx = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        client_port = transport.get_extra_info('peername')[1]
+        with self.receiver.lock:
+            self.client_idx = self.receiver.next_client_idx
+            self.receiver.next_client_idx += 1
+            self.receiver.clients[self.client_idx] = self
+            self.receiver.client_ports[self.client_idx] = client_port
+        self.receiver._log(f"Client #{self.client_idx} connected (port {client_port})")
+
+    def data_received(self, data):
+        self.buffer += data.decode('utf-8', errors='replace')
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            line = line.strip()
+            if line:
+                self.receiver._parse_line(line, self.client_idx)
+
+    def connection_lost(self, exc):
+        with self.receiver.lock:
+            self.receiver.clients.pop(self.client_idx, None)
+            self.receiver.client_ports.pop(self.client_idx, None)
+            self.receiver.client_local_ids.pop(self.client_idx, None)
+            for token, idx in list(self.receiver.client_token.items()):
+                if idx == self.client_idx:
+                    del self.receiver.client_token[token]
+                    break
+        self.receiver._log(f"Client #{self.client_idx} disconnected")
+
+    def send(self, data: str):
+        if self.transport and not self.transport.is_closing():
+            self.transport.write((data + "\n").encode('utf-8'))
+
 # ========== BRIDGE RECEIVER ==========
 class BridgeReceiver:
     def __init__(self, host='127.0.0.1', port=5556):
         self.host = host
         self.port = port
         self.running = False
-        self.server_socket: Optional[socket.socket] = None
-        self.clients: Dict[int, socket.socket] = {}
-        self.socket_to_idx: Dict[socket.socket, int] = {}
-        self.client_ports: Dict[int, int] = {}  # client_idx -> порт клиента
+        self._server = None
+        self.clients: Dict[int, BridgeProtocol] = {}
+        self.client_ports: Dict[int, int] = {}
         self.players: Dict[int, dict] = {}
         self.client_local_ids: Dict[int, int] = {}
         self.client_token: Dict[str, int] = {}
         self.lock = threading.Lock()
-        self.thread: Optional[threading.Thread] = None
         self.log_callback = None
         self.token_callback = None
         self.next_client_idx = 1
+        self.app = None
 
         self.server_name = ""
         self.server_map = ""
@@ -100,100 +141,35 @@ class BridgeReceiver:
         if self.log_callback:
             self.log_callback(f"[Bridge] {msg}")
 
+    async def _start_async(self):
+        loop = asyncio.get_event_loop()
+        self._server = await loop.create_server(
+            lambda: BridgeProtocol(self),
+            self.host, self.port
+        )
+        self.running = True
+        self._log(f"Server listening on {self.host}:{self.port}")
+
     def start(self) -> bool:
         if self.running:
             return False
         try:
-            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.server_socket.bind((self.host, self.port))
-            self.server_socket.listen(32)
-            self.server_socket.settimeout(1.0)
-            self.running = True
-            self.thread = threading.Thread(target=self._accept_loop, daemon=True)
-            self.thread.start()
-            self._log(f"Server listening on {self.host}:{self.port}")
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self._start_async())
+            else:
+                loop.run_until_complete(self._start_async())
             return True
         except Exception as e:
-            self._log(f"Failed to start server: {e}")
+            self._log(f"Failed to start: {e}")
             return False
 
     def stop(self):
         self.running = False
-        with self.lock:
-            for sock in list(self.clients.values()):
-                try: sock.close()
-                except: pass
-            self.clients.clear()
-            self.socket_to_idx.clear()
-            self.client_local_ids.clear()
-            self.client_token.clear()
-            self.client_ports.clear()
-        if self.server_socket:
-            try: self.server_socket.close()
-            except: pass
-            self.server_socket = None
-        if self.thread:
-            self.thread.join(timeout=2)
+        if self._server:
+            self._server.close()
+            self._server = None
         self._log("Server stopped")
-
-    def _accept_loop(self):
-        while self.running:
-            try:
-                conn, addr = self.server_socket.accept()
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                client_port = conn.getpeername()[1]
-                with self.lock:
-                    client_idx = self.next_client_idx
-                    self.next_client_idx += 1
-                    self.clients[client_idx] = conn
-                    self.socket_to_idx[conn] = client_idx
-                    self.client_ports[client_idx] = client_port
-                self._log(f"Client #{client_idx} connected ({addr[0]}:{client_port})")
-                threading.Thread(target=self._read_loop, args=(conn, client_idx), daemon=True).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    self._log(f"Accept error: {e}")
-                break
-
-    def _read_loop(self, client_socket: socket.socket, client_idx: int):
-        buffer = ""
-        while self.running:
-            try:
-                data = client_socket.recv(262144)
-                if not data:
-                    break
-                buffer += data.decode('utf-8', errors='replace')
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-                    if line:
-                        self._parse_line(line, client_idx)
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    self._log(f"Read error (client {client_idx}): {e}")
-                break
-        with self.lock:
-            if client_idx in self.clients:
-                del self.clients[client_idx]
-                for sock, idx in list(self.socket_to_idx.items()):
-                    if idx == client_idx:
-                        del self.socket_to_idx[sock]
-                        break
-            if client_idx in self.client_local_ids:
-                del self.client_local_ids[client_idx]
-            for token, idx in list(self.client_token.items()):
-                if idx == client_idx:
-                    del self.client_token[token]
-                    break
-            self.client_ports.pop(client_idx, None)
-        try: client_socket.close()
-        except: pass
-        self._log(f"Client #{client_idx} disconnected")
 
     def _parse_line(self, line: str, client_idx: int):
         if line.startswith("TOKEN "):
@@ -204,7 +180,8 @@ class BridgeReceiver:
                         del self.client_token[t]
                         break
                 self.client_token[token] = client_idx
-            self._log(f"Client #{client_idx} token: {token[:8]}...")
+            if _show_advanced_logs:
+                self._log(f"Client #{client_idx} token: {token[:8]}...")
             if self.token_callback:
                 self.token_callback(token, client_idx)
                 if self.app:
@@ -251,14 +228,7 @@ class BridgeReceiver:
             frozen = int(right_part[6])
             is_local = int(right_part[7]) == 1
 
-            direction = 0
-            jumped = 0
-            hook_state = 0
-            angle = 0
-            attack_tick = 0
-            target_x = 0
-            target_y = 0
-
+            direction = jumped = hook_state = angle = attack_tick = target_x = target_y = 0
             if len(right_part) >= 15:
                 direction = int(right_part[8])
                 jumped = int(right_part[9])
@@ -282,7 +252,7 @@ class BridgeReceiver:
             if self.log_callback:
                 self.log_callback(f"[Bridge] Parse error: {e} on line: {line}")
 
-    def get_local_id(self, client_idx: Optional[int] = None) -> Optional[int]:
+    def get_local_id(self, client_idx=None):
         with self.lock:
             if client_idx is not None:
                 return self.client_local_ids.get(client_idx)
@@ -291,19 +261,17 @@ class BridgeReceiver:
                     return pid
         return None
 
-    def get_player_pos(self, player_id: int) -> Optional[dict]:
+    def get_player_pos(self, player_id: int):
         with self.lock:
             data = self.players.get(player_id)
             if data:
                 return {'x': data['x'], 'y': data['y'], 'is_local': data['is_local'], 'frozen': data['frozen']}
-            return None
+        return None
 
-    def get_player_state(self, player_id: int) -> Optional[dict]:
+    def get_player_state(self, player_id: int):
         with self.lock:
             data = self.players.get(player_id)
-            if data:
-                return data.copy()
-            return None
+            return data.copy() if data else None
 
     def get_all_players(self) -> Dict[int, dict]:
         with self.lock:
@@ -319,21 +287,63 @@ class BridgeReceiver:
                 'max_players': self.server_max_players
             }
 
-# ========== TCP CONTROL SERVER ==========
+# ========== CONTROL PROTOCOL ==========
+class ControlProtocol(asyncio.Protocol):
+    def __init__(self, server):
+        self.server = server
+        self.transport = None
+        self.buffer = ""
+        self.cid = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+        transport.set_write_buffer_limits(high=262144)
+        client_port = transport.get_extra_info('peername')[1]
+        with self.server.lock:
+            self.cid = self.server.next_id
+            self.server.next_id += 1
+            self.server.clients[self.cid] = self
+            self.server.client_ports[self.cid] = client_port
+        self.server._log(f"Client #{self.cid} connected (port {client_port})")
+
+    def data_received(self, data):
+        self.buffer += data.decode('utf-8', errors='replace')
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            line = line.strip()
+            if line.startswith("TOKEN "):
+                token = line[6:].strip()
+                if _show_advanced_logs:
+                    self.server._log(f"Client #{self.cid} token: {token[:8]}...")
+                if self.server.token_callback:
+                    self.server.token_callback(self.cid, token)
+                    if self.server.app:
+                        self.server.app.sync_clients_by_pid()
+
+    def connection_lost(self, exc):
+        with self.server.lock:
+            self.server.clients.pop(self.cid, None)
+            self.server.client_ports.pop(self.cid, None)
+        self.server._log(f"Client #{self.cid} disconnected")
+
+    def send(self, data: str):
+        if self.transport and not self.transport.is_closing():
+            self.transport.write((data + "\n").encode('utf-8'))
+
+# ========== CONTROL SERVER ==========
 class ControlServer:
     def __init__(self, host='127.0.0.1', port=5555):
         self.host = host
         self.port = port
-        self.socket = None
-        self.clients: Dict[int, socket.socket] = {}
-        self.client_ports: Dict[int, int] = {}  # cid -> порт клиента
+        self._server = None
+        self.clients: Dict[int, ControlProtocol] = {}
+        self.client_ports: Dict[int, int] = {}
         self.next_id = 1
         self.lock = threading.Lock()
         self.running = False
-        self.thread: Optional[threading.Thread] = None
         self.log_callback = None
         self.token_callback = None
-        self._reader_threads: Dict[int, threading.Thread] = {}
+        self.app = None
 
     def set_log_callback(self, callback):
         self.log_callback = callback
@@ -345,154 +355,55 @@ class ControlServer:
         if self.log_callback:
             self.log_callback(f"[ControlServer] {msg}")
 
+    async def _start_async(self):
+        loop = asyncio.get_event_loop()
+        self._server = await loop.create_server(
+            lambda: ControlProtocol(self),
+            self.host, self.port
+        )
+        self.running = True
+        self._log(f"Server started on {self.host}:{self.port}")
+
     def start(self) -> bool:
         if self.running:
             return False
         try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(32)
-            self.socket.settimeout(1.0)
-            self.running = True
-            self.thread = threading.Thread(target=self._accept_loop, daemon=True)
-            self.thread.start()
-            self._log(f"Server started on {self.host}:{self.port}")
+            loop = asyncio.get_event_loop()
+            loop.create_task(self._start_async())
             return True
         except Exception as e:
-            self._log(f"Failed to start server: {e}")
+            self._log(f"Failed to start: {e}")
             return False
 
     def stop(self):
         self.running = False
-        if self.socket:
-            try: self.socket.close()
-            except: pass
+        if self._server:
+            self._server.close()
+            self._server = None
         with self.lock:
-            for sock in self.clients.values():
-                try: sock.close()
-                except: pass
             self.clients.clear()
             self.client_ports.clear()
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=2)
-
-    def _read_first_token(self, sock) -> Optional[str]:
-        try:
-            sock.settimeout(2.0)
-            data = b""
-            while b'\n' not in data:
-                chunk = sock.recv(1024)
-                if not chunk:
-                    break
-                data += chunk
-            line = data.decode('utf-8', errors='replace').split('\n')[0]
-            if line.startswith("TOKEN "):
-                return line[6:].strip()
-        except Exception:
-            pass
-        finally:
-            sock.settimeout(1.0)
-        return None
-
-    def _reader_loop(self, sock, cid):
-        buffer = ""
-        while self.running:
-            try:
-                data = sock.recv(4096)
-                if not data:
-                    break
-                buffer += data.decode('utf-8', errors='replace')
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-                    if line.startswith("TOKEN "):
-                        token = line[6:].strip()
-                        self._log(f"Client #{cid} new token: {token[:8]}...")
-                        if self.token_callback:
-                            self.token_callback(cid, token)
-                            if self.app:
-                                self.app.sync_clients_by_pid()
-            except socket.timeout:
-                continue
-            except Exception:
-                break
-        with self.lock:
-            if cid in self.clients:
-                del self.clients[cid]
-            self.client_ports.pop(cid, None)
-            self._reader_threads.pop(cid, None)
-        try: sock.close()
-        except: pass
-        self._log(f"Client #{cid} disconnected")
-
-    def _accept_loop(self):
-        while self.running:
-            try:
-                conn, addr = self.socket.accept()
-                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
-
-                client_port = conn.getpeername()[1]
-                token = self._read_first_token(conn)
-
-                with self.lock:
-                    cid = self.next_id
-                    self.next_id += 1
-                    self.clients[cid] = conn
-                    self.client_ports[cid] = client_port
-
-                if token:
-                    self._log(f"Client #{cid} connected ({addr[0]}:{client_port}) token={token[:8]}...")
-                    if self.token_callback:
-                        self.token_callback(cid, token)
-                else:
-                    self._log(f"Client #{cid} connected ({addr[0]}:{client_port}) — no token")
-
-                conn.settimeout(1.0)
-                reader_thread = threading.Thread(target=self._reader_loop, args=(conn, cid), daemon=True)
-                reader_thread.start()
-                self._reader_threads[cid] = reader_thread
-
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    self._log(f"Accept error: {e}")
-                break
+        self._log("Server stopped")
 
     def send_command(self, client_ids: List[int], command: str) -> Dict[int, bool]:
         results = {}
         with self.lock:
-            tasks = []
+            targets = []
             for cid in client_ids:
-                sock = self.clients.get(cid)
-                if not sock:
+                proto = self.clients.get(cid)
+                if not proto:
                     results[cid] = False
                     continue
                 final_cmd = replace_placeholders(command, cid)
-                tasks.append((cid, sock, final_cmd))
+                targets.append((cid, proto, final_cmd))
 
-        def send_to_one(cid, sock, data):
+        for cid, proto, cmd in targets:
             try:
-                sock.sendall((data + "\n").encode('utf-8'))
-                return cid, True
+                proto.send(cmd)
+                results[cid] = True
             except Exception:
-                try: sock.close()
-                except: pass
-                with self.lock:
-                    if cid in self.clients:
-                        del self.clients[cid]
-                        self.client_ports.pop(cid, None)
-                return cid, False
+                results[cid] = False
 
-        if tasks:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(tasks), 32)) as executor:
-                futures = [executor.submit(send_to_one, cid, sock, cmd) for cid, sock, cmd in tasks]
-                for future in concurrent.futures.as_completed(futures):
-                    cid, ok = future.result()
-                    results[cid] = ok
         return results
 
     def get_online_clients(self) -> List[int]:
@@ -501,26 +412,17 @@ class ControlServer:
 
     def remove_client(self, client_id: int):
         with self.lock:
-            if client_id in self.clients:
-                try: self.clients[client_id].close()
-                except: pass
-                del self.clients[client_id]
-                self.client_ports.pop(client_id, None)
+            proto = self.clients.pop(client_id, None)
+            self.client_ports.pop(client_id, None)
+        if proto and proto.transport:
+            proto.transport.close()
 
     def check_alive(self, client_id: int) -> bool:
         with self.lock:
-            sock = self.clients.get(client_id)
-            if not sock:
+            proto = self.clients.get(client_id)
+            if not proto:
                 return False
-            try:
-                sock.sendall(b'')
-                return True
-            except:
-                try: sock.close()
-                except: pass
-                del self.clients[client_id]
-                self.client_ports.pop(client_id, None)
-                return False
+            return proto.transport and not proto.transport.is_closing()
 
 # ========== HDDNet CLIENT MANAGER ==========
 class HDDNetClientManager:
@@ -570,6 +472,8 @@ class HDDNetClientManager:
                 self.processes[client_id] = proc
                 self.log_flags[client_id] = show_logs
 
+            self._apply_efficiency_mode(proc.pid)
+
             def reader():
                 for line_bytes in iter(proc.stdout.readline, b''):
                     if line_bytes:
@@ -596,6 +500,60 @@ class HDDNetClientManager:
         except Exception as e:
             self._log(f"❌ Failed to start client #{client_id}: {e}")
             return False
+
+    def _apply_efficiency_mode(self, pid: int):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+            ProcessPowerThrottling = 4
+            PROCESS_QUERY_INFORMATION = 0x0400
+            PROCESS_SET_INFORMATION = 0x0200
+            IDLE_PRIORITY_CLASS = 0x00000040
+
+            class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+                _fields_ = [
+                    ("Version", wintypes.ULONG),
+                    ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            hProcess = kernel32.OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION,
+                False,
+                pid
+            )
+            if not hProcess:
+                return
+
+            kernel32.SetPriorityClass(hProcess, IDLE_PRIORITY_CLASS)
+
+            state = PROCESS_POWER_THROTTLING_STATE()
+            state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION
+            state.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            state.StateMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+
+            kernel32.SetProcessInformation(
+                hProcess,
+                ProcessPowerThrottling,
+                ctypes.byref(state),
+                ctypes.sizeof(state)
+            )
+            kernel32.CloseHandle(hProcess)
+            if _show_advanced_logs:
+                self._log(f"✅ Client #{self._get_client_id_by_pid(pid)} → Efficiency Mode + IDLE priority")
+        except Exception as e:
+            self._log(f"⚠️ Efficiency mode failed: {e}")
+
+    def _get_client_id_by_pid(self, pid: int) -> str:
+        with self.lock:
+            for cid, proc in self.processes.items():
+                if proc.pid == pid:
+                    return str(cid)
+        return "?"
 
     def set_show_logs(self, client_id: int, show: bool):
         with self.lock:
@@ -1606,7 +1564,9 @@ class DMClientsApp:
         self._loop = asyncio.get_event_loop()
         self._last_scroll_time = 0
         self._log_update_timer = 0
+        self._auto_scroll = True
         self.MAX_LOG_LINES = 2000
+        self.show_advanced_logs = False
 
         self.control_server = ControlServer()
         self.client_manager = HDDNetClientManager(self.add_log)
@@ -1630,7 +1590,8 @@ class DMClientsApp:
             if token in self.bridge_receiver.client_token:
                 bridge_cidx = self.bridge_receiver.client_token[token]
                 self.control_to_bridge[cid] = bridge_cidx
-                self.add_log(f"✅ Synced: Control #{cid} ↔ Bridge #{bridge_cidx}")
+                if _show_advanced_logs:
+                    self.add_log(f"✅ Synced: Control #{cid} ↔ Bridge #{bridge_cidx}")
                 self.sync_clients_by_pid()
             else:
                 self._pending_control_tokens[token] = cid
@@ -1639,7 +1600,8 @@ class DMClientsApp:
             if token in self._pending_control_tokens:
                 cid = self._pending_control_tokens.pop(token)
                 self.control_to_bridge[cid] = bridge_cidx
-                self.add_log(f"✅ Synced: Control #{cid} ↔ Bridge #{bridge_cidx}")
+                if _show_advanced_logs:
+                    self.add_log(f"✅ Synced: Control #{cid} ↔ Bridge #{bridge_cidx}")
                 self.sync_clients_by_pid()
             else:
                 self._pending_bridge_tokens[token] = bridge_cidx
@@ -1647,8 +1609,7 @@ class DMClientsApp:
         self.control_server.set_token_callback(on_control_token)
         self.bridge_receiver.set_token_callback(on_bridge_token)
 
-        self.NUM_CLIENTS = 28
-        self.clients_per_proxy = 2
+        self._detect_config()
 
         self.send_checkboxes: List[ft.Checkbox] = []
         self.logs_checkboxes: List[ft.Checkbox] = []
@@ -1709,20 +1670,33 @@ class DMClientsApp:
 
     def add_log(self, text: str):
         def _add():
-            self.log_box.controls.append(ft.Text(text, size=14, selectable=True))
-            if len(self.log_box.controls) > self.MAX_LOG_LINES:
-                self.log_box.controls = self.log_box.controls[-self.MAX_LOG_LINES:]
+            lines = self._log_text.value.split('\n') if self._log_text.value else []
+            lines.append(text)
+            if len(lines) > self.MAX_LOG_LINES:
+                lines = lines[-self.MAX_LOG_LINES:]
+            self._log_text.value = '\n'.join(lines)
+
             if not self.console_container.visible:
                 return
+
             self.page.update()
-            async def scroll():
-                await asyncio.sleep(0.05)
-                try:
-                    await self.log_box.scroll_to(offset=-1, duration=0)
-                except Exception:
-                    pass
-            asyncio.ensure_future(scroll(), loop=self._loop)
+
+            if self._auto_scroll:
+                async def scroll():
+                    await asyncio.sleep(0.05)
+                    try:
+                        await self.log_box.scroll_to(offset=-1, duration=0)
+                    except Exception:
+                        pass
+                asyncio.ensure_future(scroll(), loop=self._loop)
+
         self._loop.call_soon_threadsafe(_add)
+
+    def _on_scroll(self, e: ft.OnScrollEvent):
+        if e.pixels >= e.max_scroll_extent - 30:
+            self._auto_scroll = True
+        else:
+            self._auto_scroll = False
 
     def _load_dictionaries(self):
         base = os.path.dirname(os.path.abspath(__file__))
@@ -1827,7 +1801,8 @@ class DMClientsApp:
             already_logged.add(client_id)
             self._synced_client_ids = already_logged
             synced += 1
-            self.add_log(f"🔗 Synced: Client #{client_id} → Control #{cid} ↔ Bridge #{bridge_cidx}")
+            if _show_advanced_logs:
+                self.add_log(f"🔗 Synced: Client #{client_id} → Control #{cid} ↔ Bridge #{bridge_cidx}")
 
         return synced
 
@@ -1984,21 +1959,38 @@ class DMClientsApp:
             dest = os.path.join(base_dir, f"HDDNet{i}.exe")
             shutil.copy(template, dest)
 
-        top_n = (new_count + cpp - 1) // cpp
-        script_path = os.path.join(os.path.dirname(__file__), "optimal_proxies_new.py")
-        if os.path.isfile(script_path):
-            with open(script_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            content = re.sub(r"TOP_N = \d+", f"TOP_N = {top_n}", content)
-            with open(script_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            self.add_log(f"🔧 TOP_N set to {top_n} (based on {new_count} clients, {cpp} per proxy)")
-
         self._generate_proxifyre_config(new_count, cpp)
         self.NUM_CLIENTS = new_count
         self.clients_per_proxy = cpp
         self._rebuild_clients_table()
         self.add_log(f"🔄 Applied: {new_count} clients, {cpp} clients per proxy")
+
+    def _detect_config(self):
+        base_dir = os.path.join(os.path.dirname(__file__), "DDNets-19.9-win64")
+        files = glob.glob(os.path.join(base_dir, "HDDNet*.exe"))
+    
+        max_id = 0
+        for f in files:
+            match = re.search(r'HDDNet(\d+)\.exe$', os.path.basename(f))
+            if match:
+                max_id = max(max_id, int(match.group(1)))
+        self.NUM_CLIENTS = max_id if max_id > 0 else 28
+    
+        config_path = os.path.join(os.path.dirname(__file__), "ProxiFyre", "app-config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                proxies = config.get("proxies", [])
+                if proxies and "appNames" in proxies[0]:
+                    app_count = len(proxies[0]["appNames"])
+                    self.clients_per_proxy = app_count // 2
+                else:
+                    self.clients_per_proxy = 2
+            except:
+                self.clients_per_proxy = 2
+        else:
+            self.clients_per_proxy = 2
 
     def _generate_proxifyre_config(self, num_clients: int, clients_per_proxy: int = None):
         if clients_per_proxy is None:
@@ -2084,7 +2076,13 @@ class DMClientsApp:
                                   on_click=lambda e: self.on_send_click())
         self.page.input_field.on_submit = lambda e: self.on_send_click()
 
-        self.log_box = ft.ListView(expand=True, spacing=5, auto_scroll=False)
+        self._log_text = ft.Text("", size=14, selectable=True)
+        self.log_box = ft.ListView(
+            controls=[self._log_text],
+            expand=True,
+            auto_scroll=False,
+            on_scroll=self._on_scroll,
+        )
 
         self.console_container = ft.Container(
             content=ft.Column([
@@ -2678,6 +2676,11 @@ class DMClientsApp:
         semicolon_switch = ft.Switch(label='Adding ";" in commands', value=True, on_change=self.on_semicolon_switch_change)
         proxy_logs_cb = ft.Checkbox(label="Show Proxy logs", value=self.show_proxy_logs, on_change=self.on_proxy_logs_change)
         proxifyre_logs_cb = ft.Checkbox(label="Show ProxiFyre logs", value=self.show_proxifyre_logs, on_change=self.on_proxifyre_logs_change)
+        self.advanced_logs_cb = ft.Checkbox(
+            label="Advanced logs",
+            value=False,
+            on_change=lambda e: globals().__setitem__('_show_advanced_logs', e.control.value)
+        )
 
         block1 = ft.Container(
             content=ft.Row([
@@ -2710,6 +2713,7 @@ class DMClientsApp:
 
         self.fix_players_switch = ft.Switch(label="Try to fix player loading", value=False, on_change=self.on_fix_players_toggle)
         self.timeout_reconnect_switch = ft.Switch(label="Timeout reconnect", value=False, on_change=self.on_timeout_reconnect_toggle)
+        self.generate_timeout_code_btn = ft.FilledButton("Generate timeout code", icon=ft.Icons.KEY, on_click=self.on_generate_timeout_code, style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
         self.num_clients_field = ft.TextField(label="Clients", value=str(self.NUM_CLIENTS), width=100,
                                               bgcolor="#1e1e24", border_color="#33334d")
         self.clients_per_proxy_field = ft.TextField(label="Clients per proxy", value=str(self.clients_per_proxy), width=120,
@@ -2737,8 +2741,9 @@ class DMClientsApp:
             content=ft.Column([
                 ft.Row([semicolon_switch,
                         self.fix_players_switch,
-                        self.timeout_reconnect_switch], spacing=10),
-                ft.Row([proxy_logs_cb, proxifyre_logs_cb], spacing=20),
+                        self.timeout_reconnect_switch,
+                        self.generate_timeout_code_btn], spacing=10),
+                ft.Row([proxy_logs_cb, proxifyre_logs_cb, self.advanced_logs_cb], spacing=20),
                 ft.Row([
                     ft.Text("Set client count:", size=14),
                     self.num_clients_field, self.clients_per_proxy_field, self.apply_clients_btn,
@@ -3143,6 +3148,11 @@ class DMClientsApp:
             self.send_action_command("conn_timeout 100; cl_reconnect_timeout 120")
             self.add_log("🔁 Fast reconnect disabled")
 
+    def on_generate_timeout_code(self, e):
+        cmd = "cl_timeout_code {r}{r}{r}{r}{r}{r}{r}{r}{r}{r}{r}{r}{r}{r}"
+        self.send_action_command(cmd)
+        self.add_log("🔑 Timeout code generated and sent")
+
     def toggle_client(self, client_id: int, button: ft.Button):
         if self.client_manager.is_running(client_id):
             self.client_manager.stop(client_id)
@@ -3171,9 +3181,9 @@ class DMClientsApp:
                 btn.content = ft.Text("Connect")
                 btn.icon = ft.Icons.PLAY_ARROW
                 btn.update()
+                time.sleep(0.1)
             self.all_clients_btn.content = ft.Text("Start all clients")
             self.all_clients_btn.icon = ft.Icons.PLAY_ARROW
-            self.add_log(f"🛑 All {self.NUM_CLIENTS} HDDNet clients stopped")
         else:
             def launch_with_delay():
                 started = 0
@@ -3193,10 +3203,8 @@ class DMClientsApp:
                     self._loop.call_soon_threadsafe(lambda: setattr(self.all_clients_btn, 'icon', ft.Icons.STOP))
                 self._loop.call_soon_threadsafe(self.update_clients_stats)
                 self._loop.call_soon_threadsafe(self.page.update)
-                self.add_log(f"🚀 Started {started} HDDNet clients (now: {new_running}/{self.NUM_CLIENTS})")
 
             threading.Thread(target=launch_with_delay, daemon=True).start()
-            self.add_log(f"🚀 Starting {self.NUM_CLIENTS} HDDNet clients with 100ms delay...")
 
         self.all_clients_btn.update()
         self.update_clients_stats()
@@ -3305,11 +3313,19 @@ class DMClientsApp:
         if self.spare_proxies_switch.value:
             count = self.spare_count_field.value.strip() or "5"
             cmd.append(f"--spare-proxies={count}")
+        top_n = (self.NUM_CLIENTS + self.clients_per_proxy - 1) // self.clients_per_proxy
+        cmd.append(f"--top-n={top_n}")
+        if self.spare_proxies_switch.value:
+            count = self.spare_count_field.value.strip() or "5"
+            cmd.append(f"--spare-proxies={count}")
+
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1, encoding='utf-8', env=env,
-                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0, 
+                                errors='replace')
         self.optimal_proxies_proc = proc
         def read_output():
             try:
@@ -3536,6 +3552,7 @@ class DMClientsApp:
                 return
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
             proc_ports = subprocess.Popen(
                 [sys.executable, "-u", ports_script],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3565,7 +3582,8 @@ class DMClientsApp:
                         [proxifyre_path],
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                         text=True, bufsize=1, encoding='utf-8',
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0, 
+                        errors='replace'
                     )
                     self.proxifyre_proc = proc_prox
                     self.add_log(f"[ProxiFyre] Started (PID {proc_prox.pid})")
@@ -3593,7 +3611,7 @@ class DMClientsApp:
             btn.update()
 
     def clear_logs(self):
-        self.log_box.controls.clear()
+        self._log_text.value = ""
         self.page.update()
         self.add_log("🧹 Logs cleared")
 
@@ -3932,10 +3950,8 @@ if __name__ == "__main__":
         try:
             import winloop
             winloop.install()
-            print("[OK] Winloop activated")
         except ImportError:
-            print("[WARN] Winloop not installed")
-
+            pass
     try:
         ft.run(main)
     except KeyboardInterrupt:
