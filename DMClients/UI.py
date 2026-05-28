@@ -23,6 +23,13 @@ _global_names = []
 _global_dictionary = []
 _show_advanced_logs = False
 
+def _async_timer(delay: float, callback, *args):
+    """threading.Timer replacement using asyncio — returns asyncio.Task."""
+    async def _wait():
+        await asyncio.sleep(delay)
+        callback(*args)
+    return asyncio.create_task(_wait())
+
 # ========== HELPER FUNCTIONS ==========
 class DotDict:
     def __init__(self, **kw):
@@ -38,33 +45,6 @@ def kill_process_tree(pid: int):
         parent.kill()
     except psutil.NoSuchProcess:
         pass
-
-def random_char() -> str:
-    chars = string.ascii_letters + string.digits + "._-"
-    return random.choice(chars)
-
-def replace_placeholders(cmd: str, client_index: int) -> str:
-    cmd = cmd.replace("{i}", str(client_index))
-    while "{r}" in cmd:
-        cmd = cmd.replace("{r}", random_char(), 1)
-    def replace_ri(match):
-        max_val = int(match.group(1))
-        return str(random.randint(0, max_val))
-    cmd = re.sub(r'{ri-(\d+)}', replace_ri, cmd)
-    while "{n}" in cmd:
-        if _global_names:
-            cmd = cmd.replace("{n}", random.choice(_global_names), 1)
-        else:
-            cmd = cmd.replace("{n}", "lol", 1)
-    while "{d}" in cmd:
-        if _global_dictionary:
-            cmd = cmd.replace("{d}", random.choice(_global_dictionary), 1)
-        else:
-            cmd = cmd.replace("{d}", "lol", 1)
-    while "{c}" in cmd:
-        ch = chr(random.randint(0x4E00, 0x9FFF))
-        cmd = cmd.replace("{c}", ch, 1)
-    return cmd
 
 # ========== BRIDGE PROTOCOL ==========
 class BridgeProtocol(asyncio.Protocol):
@@ -385,6 +365,42 @@ class ControlServer:
             self.client_ports.clear()
         self._log("Server stopped")
 
+    def random_char(self) -> str:
+        import random, string
+        return random.choice(string.ascii_letters + string.digits + "._-")
+
+    def replace_placeholders(self, cmd: str, client_index: int) -> str:
+    
+        online = sorted(self.clients.keys())
+        rank = online.index(client_index) + 1 if client_index in online else client_index
+        cmd = cmd.replace("{i}", str(rank))
+    
+        while "{r}" in cmd:
+            cmd = cmd.replace("{r}", self.random_char(), 1)
+    
+        def replace_ri(match):
+            max_val = int(match.group(1))
+            return str(random.randint(0, max_val))
+        cmd = re.sub(r'{ri-(\d+)}', replace_ri, cmd)
+    
+        while "{n}" in cmd:
+            if _global_names:
+                cmd = cmd.replace("{n}", random.choice(_global_names), 1)
+            else:
+                cmd = cmd.replace("{n}", "lol", 1)
+    
+        while "{d}" in cmd:
+            if _global_dictionary:
+                cmd = cmd.replace("{d}", random.choice(_global_dictionary), 1)
+            else:
+                cmd = cmd.replace("{d}", "lol", 1)
+    
+        while "{c}" in cmd:
+            ch = chr(random.randint(0x4E00, 0x9FFF))
+            cmd = cmd.replace("{c}", ch, 1)
+    
+        return cmd
+
     def send_command(self, client_ids: List[int], command: str) -> Dict[int, bool]:
         results = {}
         with self.lock:
@@ -394,8 +410,17 @@ class ControlServer:
                 if not proto:
                     results[cid] = False
                     continue
-                final_cmd = replace_placeholders(command, cid)
+                final_cmd = self.replace_placeholders(command, cid)
                 targets.append((cid, proto, final_cmd))
+    
+        for cid, proto, cmd in targets:
+            try:
+                proto.send(cmd)
+                results[cid] = True
+            except Exception:
+                results[cid] = False
+    
+        return results
 
         for cid, proto, cmd in targets:
             try:
@@ -429,7 +454,7 @@ class HDDNetClientManager:
     def __init__(self, log_callback):
         self.log_callback = log_callback
         self.processes: Dict[int, subprocess.Popen] = {}
-        self.log_threads: Dict[int, threading.Thread] = {}
+        self.log_threads: Dict[int, asyncio.Task] = {}
         self.log_flags: Dict[int, bool] = {}
         self.lock = threading.Lock()
         self.base_dir = os.path.join(os.path.dirname(__file__), "DDNets-19.9-win64")
@@ -477,7 +502,10 @@ class HDDNetClientManager:
             def reader():
                 for line_bytes in iter(proc.stdout.readline, b''):
                     if line_bytes:
-                        line = line_bytes.decode('utf-8', errors='replace').rstrip()
+                        try:
+                            line = line_bytes.decode('utf-8').rstrip()
+                        except UnicodeDecodeError:
+                            line = line_bytes.decode('cp1251', errors='replace').rstrip()
                         with self.lock:
                             self.client_log[client_id] = line
                             show = self.log_flags.get(client_id, False)
@@ -491,8 +519,7 @@ class HDDNetClientManager:
                     self.log_flags.pop(client_id, None)
                 self._log(f"Client #{client_id} has terminated")
 
-            t = threading.Thread(target=reader, daemon=True)
-            t.start()
+            t = asyncio.create_task(asyncio.to_thread(reader))
             with self.lock:
                 self.log_threads[client_id] = t
             self._log(f"✅ Client #{client_id} started (PID {proc.pid})")
@@ -627,8 +654,8 @@ class DMClientsApp:
             self.app = app
             self._running = False
             self._active_clients: set = set()
-            self._pending_timers: Dict[int, threading.Timer] = {}
-            self._rule_threads: Dict[int, threading.Thread] = {}
+            self._pending_timers: Dict[int, asyncio.Task] = {}
+            self._rule_threads: Dict[int, asyncio.Task] = {}
             self._filepath = ""
             self._base_delay_ms = 0
             self._freeze_watcher_task = None
@@ -708,14 +735,11 @@ class DMClientsApp:
                 duration = self._calc_macro_duration(self._filepath)
                 if duration <= 0:
                     duration = 2000
-                timer = threading.Timer((duration + 150) / 1000.0, lambda: self._on_macro_done(cid))
-                timer.daemon = True
-                timer.start()
+                timer = _async_timer((duration + 150) / 1000.0, lambda: self._on_macro_done(cid))
                 self._pending_timers[cid] = timer
 
             elif ext == 'rule':
-                thread = threading.Thread(target=self._run_rule, args=(cid,), daemon=True)
-                thread.start()
+                thread = asyncio.create_task(asyncio.to_thread(self._run_rule, cid))
                 self._rule_threads[cid] = thread
 
             self.app.add_log(f"▶️ Macro started for client #{cid}")
@@ -771,9 +795,7 @@ class DMClientsApp:
             if not self._running:
                 return
             if max_duration > 0:
-                timer = threading.Timer((max_duration + 150) / 1000.0, lambda: self._on_macro_done(cid))
-                timer.daemon = True
-                timer.start()
+                timer = _async_timer((max_duration + 150) / 1000.0, lambda: self._on_macro_done(cid))
                 self._pending_timers[cid] = timer
             else:
                 self._on_macro_done(cid)
@@ -1071,9 +1093,7 @@ class DMClientsApp:
                 if delay_ms == 0:
                     self._start_macro(cid)
                 else:
-                    timer = threading.Timer(delay_ms / 1000.0, self._start_macro, args=[cid])
-                    timer.daemon = True
-                    timer.start()
+                    timer = _async_timer(delay_ms / 1000.0, self._start_macro, cid)
                     self._pending_timers[cid] = timer
             self.app.add_log(f"▶️ Macros playback started for {len(online)} clients")
 
@@ -1252,6 +1272,7 @@ class DMClientsApp:
                     ft.Divider(height=1, color="#33334d"),
                     ft.Row([save_changes_btn, reload_btn, self.editor_status], spacing=10),
                     self.code_editor,
+                    ft.Text("Documentation: ", selectable=True, spans=[ft.TextSpan("https://github.com/lothiann/DMClients#macros--rules", url="https://github.com/lothiann/DMClients#macros--rules", style=ft.TextStyle(color="#A855F7", size=14))]),
                 ], spacing=10),
                 padding=10, bgcolor="#1a1a24", border_radius=10
             )
@@ -1402,7 +1423,7 @@ class DMClientsApp:
             self.execute_btn.update()
             self.editor_status.value = "Executing..."
             self.editor_status.update()
-            threading.Thread(target=self._run_code, args=(code,), daemon=True).start()
+            asyncio.create_task(asyncio.to_thread(self._run_code, code))
 
         def _on_code_change(self, e):
             if self.code_editor and self.code_editor.value:
@@ -1540,6 +1561,7 @@ class DMClientsApp:
                     ft.Row([self.save_as_field], spacing=10),
                     btn_row,
                     self.code_editor,
+                    ft.Text("Documentation: ", selectable=True, spans=[ft.TextSpan("https://github.com/lothiann/DMClients#code-execute", url="https://github.com/lothiann/DMClients#code-execute", style=ft.TextStyle(color="#A855F7", size=14))]),
                 ], spacing=10),
                 padding=10, bgcolor="#1a1a24", border_radius=10
             )
@@ -1613,6 +1635,8 @@ class DMClientsApp:
 
         self.send_checkboxes: List[ft.Checkbox] = []
         self.logs_checkboxes: List[ft.Checkbox] = []
+        self.header_logs_cb = None
+        self.header_cmd_cb = None
         self.connect_buttons: List[ft.Button] = []
         self.mem_texts: List[ft.Text] = []
         self.cpu_texts: List[ft.Text] = []
@@ -1635,7 +1659,7 @@ class DMClientsApp:
         self.show_proxifyre_logs = False
 
         self.prev_attack_tick: Dict[int, int] = {}
-        self._config_timer: Optional[threading.Timer] = None
+        self._config_timer: Optional[asyncio.Task] = None
 
         self.names: List[str] = []
         self.dictionary: List[str] = []
@@ -1835,7 +1859,7 @@ class DMClientsApp:
                 if need_update and now - last_update > 0.5:
                     last_update = now
                     self._loop.call_soon_threadsafe(self.page.update)
-        threading.Thread(target=monitor_loop, daemon=True).start()
+        asyncio.create_task(asyncio.to_thread(monitor_loop))
 
     async def monitor_loop(self):
         cpu_count = psutil.cpu_count(logical=True)
@@ -2062,6 +2086,49 @@ class DMClientsApp:
         except Exception as e:
             self.add_log(f"❌ Error: {e}")
 
+    def _on_header_logs_changed(self, e):
+        new_val = True if e.control.value is not False else False
+        for i, cb in enumerate(self.logs_checkboxes):
+            cb.value = new_val
+            cb.update()
+            self.client_manager.set_show_logs(i + 1, new_val)
+        self.header_logs_cb.value = new_val
+        self.header_logs_cb.update()
+
+    def _on_header_cmd_changed(self, e):
+        new_val = True if e.control.value is not False else False
+        for cb in self.cmd_checkboxes:
+            cb.value = new_val
+            cb.update()
+        self.header_cmd_cb.value = new_val
+        self.header_cmd_cb.update()
+
+    def _sync_header_logs(self):
+        if not self.header_logs_cb or not self.logs_checkboxes:
+            return
+        values = [cb.value for cb in self.logs_checkboxes]
+        if all(values):
+            self.header_logs_cb.value = True
+        else:
+            self.header_logs_cb.value = False
+        try:
+            self.header_logs_cb.update()
+        except Exception:
+            pass
+
+    def _sync_header_cmd(self):
+        if not self.header_cmd_cb or not self.cmd_checkboxes:
+            return
+        values = [cb.value for cb in self.cmd_checkboxes]
+        if all(values):
+            self.header_cmd_cb.value = True
+        else:
+            self.header_cmd_cb.value = False
+        try:
+            self.header_cmd_cb.update()
+        except Exception:
+            pass
+
     def _build_ui(self):
         self.page.input_field = ft.TextField(
             hint_text="Command...",
@@ -2146,14 +2213,28 @@ class DMClientsApp:
         )
 
     def _build_clients_table(self) -> ft.DataTable:
+        self.header_logs_cb = ft.Checkbox(
+            label="Show logs", 
+            value=False, 
+            on_change=self._on_header_logs_changed, 
+            label_style=ft.TextStyle(weight="bold")
+        )
+        self.header_cmd_cb = ft.Checkbox(
+            label="Send commands", 
+            value=True, 
+            on_change=self._on_header_cmd_changed, 
+            label_style=ft.TextStyle(weight="bold")
+        )
+
         columns = [
             ft.DataColumn(ft.Text("Client", weight="bold")),
             ft.DataColumn(ft.Text("MEM (MB)", weight="bold")),
             ft.DataColumn(ft.Text("CPU (%)", weight="bold")),
-            ft.DataColumn(ft.Text("Send commands", weight="bold")),
-            ft.DataColumn(ft.Text("Show logs", weight="bold")),
+            ft.DataColumn(self.header_cmd_cb),
+            ft.DataColumn(self.header_logs_cb),
             ft.DataColumn(ft.Text("Action", weight="bold")),
         ]
+        
         rows = []
         self.send_checkboxes.clear()
         self.logs_checkboxes.clear()
@@ -2162,11 +2243,9 @@ class DMClientsApp:
         self.cpu_texts.clear()
 
         for i in range(1, self.NUM_CLIENTS + 1):
-            send_cb = ft.Checkbox(value=True)
-            logs_cb = ft.Checkbox(value=False)
-            def on_logs_change(e, cid=i):
-                self.client_manager.set_show_logs(cid, e.control.value)
-            logs_cb.on_change = on_logs_change
+            send_cb = ft.Checkbox(value=True, on_change=lambda e: self._sync_header_cmd())
+            logs_cb = ft.Checkbox(value=False, on_change=lambda e, cid=i: (self.client_manager.set_show_logs(cid, e.control.value), self._sync_header_logs()))
+            
             self.send_checkboxes.append(send_cb)
             self.logs_checkboxes.append(logs_cb)
 
@@ -2213,6 +2292,45 @@ class DMClientsApp:
             width=float("inf"),
         )
 
+    def _on_header_logs_changed(self, e):
+        if not self.logs_checkboxes:
+            return
+        all_on = all(cb.value for cb in self.logs_checkboxes)
+        new_val = not all_on
+        
+        for i, cb in enumerate(self.logs_checkboxes):
+            cb.value = new_val
+            self.client_manager.set_show_logs(i + 1, new_val)
+            cb.update()
+            
+        self.header_logs_cb.value = new_val
+        self.header_logs_cb.update()
+
+    def _on_header_cmd_changed(self, e):
+        if not self.send_checkboxes:
+            return
+        all_on = all(cb.value for cb in self.send_checkboxes)
+        new_val = not all_on
+        
+        for cb in self.send_checkboxes:
+            cb.value = new_val
+            cb.update()
+            
+        self.header_cmd_cb.value = new_val
+        self.header_cmd_cb.update()
+
+    def _sync_header_logs(self):
+        if not self.header_logs_cb or not self.logs_checkboxes:
+            return
+        self.header_logs_cb.value = all(cb.value for cb in self.logs_checkboxes)
+        self.header_logs_cb.update()
+
+    def _sync_header_cmd(self):
+        if not self.header_cmd_cb or not self.send_checkboxes:
+            return
+        self.header_cmd_cb.value = all(cb.value for cb in self.send_checkboxes)
+        self.header_cmd_cb.update()
+
     def _build_tab_ui(self):
         server_info_table = ft.DataTable(
             columns=[
@@ -2258,6 +2376,7 @@ class DMClientsApp:
             ft.DataColumn(ft.Text("Angle", weight="bold")),
             ft.DataColumn(ft.Text("Attack", weight="bold")),
             ft.DataColumn(ft.Text("Aim", weight="bold")),
+            ft.DataColumn(ft.Text("Target", weight="bold")),
         ]
         self.players_table = ft.DataTable(
             columns=players_columns,
@@ -2290,28 +2409,42 @@ class DMClientsApp:
         self.tab_container = ft.Container(content=tab_view, expand=True, visible=False)
 
     def _build_actions_ui(self):
-        player_name_field = ft.TextField(label="Player name", hint_text="Enter name", expand=True,
-                                         bgcolor="#1e1e24", border_color="#33334d")
+        player_name_field = ft.TextField(label="Player name", hint_text="Enter name", expand=True, tooltip="player_name ...",
+                                         bgcolor="#1e1e24", border_color="#33334d", value="Bot {i}")
         player_name_field.on_submit = self.on_player_name_submit
         player_name_send = ft.FilledButton("Set name", icon=ft.Icons.PERSON,
                                            on_click=self.on_player_name_submit,
                                            style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
 
-        player_skin_field = ft.TextField(label="Player skin", hint_text="skin ID", expand=True,
-                                         bgcolor="#1e1e24", border_color="#33334d")
+        player_clan_field = ft.TextField(label="Player clan", hint_text="Enter clan", expand=True, tooltip="player_clan ...",
+                                         bgcolor="#1e1e24", border_color="#33334d", value="DMClients")
+        player_clan_field.on_submit = self.on_player_clan_submit
+        player_clan_send = ft.FilledButton("Set clan", icon=ft.Icons.GROUP,
+                                           on_click=self.on_player_clan_submit,
+                                           style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
+
+        player_skin_field = ft.TextField(label="Player skin", hint_text="skin ID", expand=True, tooltip="player_skin ...",
+                                         bgcolor="#1e1e24", border_color="#33334d", value="itsabot")
         player_skin_field.on_submit = self.on_player_skin_submit
         player_skin_send = ft.FilledButton("Set skin", icon=ft.Icons.FACE,
                                            on_click=self.on_player_skin_submit,
                                            style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
 
-        dummy_name_field = ft.TextField(label="Dummy name", hint_text="Enter dummy name", expand=True,
+        dummy_name_field = ft.TextField(label="Dummy name", hint_text="Enter dummy name", expand=True, tooltip="dummy_name ...",
                                         bgcolor="#1e1e24", border_color="#33334d")
         dummy_name_field.on_submit = self.on_dummy_name_submit
         dummy_name_send = ft.FilledButton("Set dummy name", icon=ft.Icons.SMART_TOY,
                                           on_click=self.on_dummy_name_submit,
                                           style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
 
-        dummy_skin_field = ft.TextField(label="Dummy skin", hint_text="skin ID", expand=True,
+        dummy_clan_field = ft.TextField(label="Dummy clan", hint_text="Enter dummy clan", expand=True, tooltip="dummy_clan ...",
+                                        bgcolor="#1e1e24", border_color="#33334d")
+        dummy_clan_field.on_submit = self.on_dummy_clan_submit
+        dummy_clan_send = ft.FilledButton("Set dummy clan", icon=ft.Icons.GROUP,
+                                          on_click=self.on_dummy_clan_submit,
+                                          style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
+
+        dummy_skin_field = ft.TextField(label="Dummy skin", hint_text="skin ID", expand=True, tooltip="dummy_skin ...",
                                         bgcolor="#1e1e24", border_color="#33334d")
         dummy_skin_field.on_submit = self.on_dummy_skin_submit
         dummy_skin_send = ft.FilledButton("Set skin", icon=ft.Icons.FACE,
@@ -2321,6 +2454,7 @@ class DMClientsApp:
         left_container = ft.Container(
             content=ft.Column([
                 ft.Row([player_name_field, player_name_send], spacing=10),
+                ft.Row([player_clan_field, player_clan_send], spacing=10),
                 ft.Row([player_skin_field, player_skin_send], spacing=10),
             ], spacing=10),
             padding=10, bgcolor="#1a1a24", border_radius=10, expand=True
@@ -2328,13 +2462,14 @@ class DMClientsApp:
         right_container = ft.Container(
             content=ft.Column([
                 ft.Row([dummy_name_field, dummy_name_send], spacing=10),
+                ft.Row([dummy_clan_field, dummy_clan_send], spacing=10),
                 ft.Row([dummy_skin_field, dummy_skin_send], spacing=10),
             ], spacing=10),
             padding=10, bgcolor="#1a1a24", border_radius=10, expand=True
         )
 
         connect_server_field = ft.TextField(label="Connect to", hint_text="server:port", expand=True,
-                                            bgcolor="#1e1e24", border_color="#33334d")
+                                            bgcolor="#1e1e24", border_color="#33334d", value="localhost:8303")
         self.connect_button = ft.FilledButton(content=ft.Text("Connect"), icon=ft.Icons.LINK,
                                               on_click=self.on_connect_click,
                                               style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
@@ -2368,8 +2503,8 @@ class DMClientsApp:
         say_send = ft.FilledButton("Send", icon=ft.Icons.SEND, on_click=self.on_say_submit,
                                    style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
 
-        self.cron_command = ft.TextField(label="Spam command", hint_text="command to spam", expand=True, bgcolor="#1e1e24", border_color="#33334d")
-        self.cron_delay = ft.TextField(label="Interval (ms)", value="1000", width=120, bgcolor="#1e1e24", border_color="#33334d")
+        self.cron_command = ft.TextField(label="Spam command", hint_text="command to spam", expand=True, bgcolor="#1e1e24", border_color="#33334d", value="say {c}{c}{c} The best DDNet bot utility -> t.me/DMClients {c}{c}{c}")
+        self.cron_delay = ft.TextField(label="Interval (ms)", value="5000", width=120, bgcolor="#1e1e24", border_color="#33334d", tooltip="For command \"say ...\" recommended 5000 ms")
         self.cron_switch = ft.Switch(label="Enable spam send", value=False, on_change=self.on_cron_toggle)
 
         self.left_cb = ft.Checkbox(label="Left", on_change=lambda e: self.on_input_checkbox_change(e, "left"))
@@ -2408,39 +2543,53 @@ class DMClientsApp:
         self.aim_x_slider.on_change = update_x_label
         self.aim_y_slider.on_change = update_y_label
 
-        self.random_aim_checkbox = ft.Checkbox(label="Random aim", value=False, on_change=self.on_random_aim_toggle)
+        self.random_aim_checkbox = ft.Checkbox(label="Random aim", value=False, tooltip="Generates random crosshair coordinates every N ms", on_change=self.on_random_aim_toggle)
         self.random_aim_interval = ft.TextField(label="Interval (ms)", value="100", width=120,
                                                 bgcolor="#1e1e24", border_color="#33334d")
-        self.random_for_all_checkbox = ft.Checkbox(label="Random for all", value=False, on_change=self.on_random_for_all_change)
+        self.random_for_all_checkbox = ft.Checkbox(label="Random for all", value=False, tooltip="Each bot gets its own random coordinates (works on the client side)", on_change=self.on_random_for_all_change)
 
         self.attack_enable_switch = ft.Switch(value=False, on_change=self.on_attack_toggle)
-        self.main_id_field = ft.TextField(label="Main ID", value="", width=100,
+        self.main_id_field = ft.TextField(label="Main ID", value="", tooltip="Which player should bots follow? (team)", width=100,
                                           bgcolor="#1e1e24", border_color="#33334d")
-        self.attack_target_field = ft.TextField(label="Target IDs", value="", width=250,
+        self.attack_target_field = ft.TextField(label="Target IDs", value="", tooltip="Which players should bots attack? (wars)", width=250,
                                                 bgcolor="#1e1e24", border_color="#33334d")
-        self.auto_aim_cb = ft.Checkbox(label="Auto aim", value=False)
-        self.hook_target_cb = ft.Checkbox(label="Hook", value=False)
-        self.fire_target_cb = ft.Checkbox(label="Fire", value=False)
-        self.fire_distance_field = ft.TextField(label="Fire dist", value="65", width=100,
+        self.auto_aim_cb = ft.Checkbox(label="Auto aim", tooltip="Enables aiming", value=True)
+        self.hook_target_cb = ft.Checkbox(label="Hook", tooltip="Enables hooking", value=True)
+        self.fire_target_cb = ft.Checkbox(label="Fire", tooltip="Enables firing", value=True)
+        self.fire_distance_field = ft.TextField(label="Fire dist", tooltip="Radius within which bots can fire", value="65", width=100,
                                                 bgcolor="#1e1e24", border_color="#33334d")
-        self.hook_distance_field = ft.TextField(label="Hook dist", value="400", width=100,
+        self.hook_distance_field = ft.TextField(label="Hook dist", tooltip="Radius within which bots can hook", value="400", width=100,
                                                 bgcolor="#1e1e24", border_color="#33334d")
-        self.target_distance_field = ft.TextField(label="Target dist", value="300", width=100,
+        self.target_distance_field = ft.TextField(label="Target dist", value="300", tooltip="Range to attack a target (war)", width=100,
                                                   bgcolor="#1e1e24", border_color="#33334d")
         self.hook_delay_field = ft.TextField(label="Hook delay (ms)", value="1000", width=100,
                                              bgcolor="#1e1e24", border_color="#33334d")
-        self.rescue_frozen_cb = ft.Checkbox(label="Rescue frozen", value=True)
+        self.rescue_frozen_cb = ft.Checkbox(label="Rescue frozen", tooltip="Bots can rescue their teammates and the main within N radius", value=True)
         self.rescue_radius_field = ft.TextField(label="Rescue radius", value="500", width=120,
                                                 bgcolor="#1e1e24", border_color="#33334d")
-        self.kill_on_freeze_cb = ft.Checkbox(label="Kill on freeze", value=False)
-        self.attack_main_cb = ft.Checkbox(label="Attack main", value=False)
-        self.move_cb = ft.Checkbox(label="Move", value=True)
-        self.stand_cb = ft.Checkbox(label="Stand", value=False)
-        self.rescue_all_cb = ft.Checkbox(label="Rescue all", value=False)
+        self.kill_on_freeze_cb = ft.Checkbox(label="Kill on freeze", tooltip="Auto respawn if frozen", value=False)
+        self.attack_main_cb = ft.Checkbox(label="Attack main", tooltip="Bots attack the main (for fun)", value=False)
+        self.move_cb = ft.Checkbox(label="Move", tooltip="Enables moving (left, right, jump)", value=True)
+        self.stand_cb = ft.Checkbox(label="Stand", tooltip="Don't move if already within N radius of the main or target", value=True)
+        self.pathfinder_cb = ft.Checkbox(label="Pathfinder", value=True, on_change=self.on_pathfinder_change, tooltip="Using Pathfinder")
+        self.rescue_all_cb = ft.Checkbox(label="Rescue all", tooltip="Bots can rescue everyone except targets (wars)", value=False, on_change=self.on_rescue_all_change)
+        self.smart_detect_cb = ft.Checkbox(label="Smart Detect", tooltip="Find frozen players without line of sight", value=True)
+        self.smart_rescue_cb = ft.Checkbox(label="Smart Rescue", tooltip="If someone frozen in rescue radius - find gradient to them via pathfinder", value=True)
         self.all_target_cb = ft.Checkbox(label="All target", value=False, on_change=self.on_all_target_change)
 
-        self.auto_hammer_cb = ft.Checkbox(label="Auto hammer", value=False)
-        self.stand_on_x_cb = ft.Checkbox(label="Stand on X only", value=False, on_change=self.on_stand_on_x_change)
+        self.auto_hammer_cb = ft.Checkbox(label="Auto hammer", tooltip="Automatically switches to hammer when attacking", value=True)
+        self.stand_on_x_cb = ft.Checkbox(label="Stand on X only [Experimental]", value=False, on_change=self.on_stand_on_x_change)
+
+        self.main_dist_field = ft.TextField(label="Main dist", value="inf", tooltip="Radius within which bots go to main (inf = unlimited)", width=100,
+                                            bgcolor="#1e1e24", border_color="#33334d")
+        self.stand_dist_field = ft.TextField(label="Stand dist", value="64", tooltip="Don't move if already within N radius of target/main", width=100,
+                                             bgcolor="#1e1e24", border_color="#33334d")
+        self.rescue_ids_field = ft.TextField(label="Rescue IDs", value="", tooltip="Specific IDs to rescue (or unrescue if Rescue all is on)", width=250,
+                                              bgcolor="#1e1e24", border_color="#33334d")
+        self.target_coords_field = ft.TextField(label="Target Coords", value="", width=400,
+                                                 hint_text="x1,y1-x2,y2; x3,y3-x4,y4",
+                                                 tooltip="Auto-target players in these zones (x1,y1-x2,y2; ...)",
+                                                 bgcolor="#1e1e24", border_color="#33334d")
 
         self.copy_id_field = ft.TextField(label="Copy from ID", width=100, value="",
                                           bgcolor="#1e1e24", border_color="#33334d")
@@ -2449,13 +2598,12 @@ class DMClientsApp:
                                         bgcolor="#1e1e24", border_color="#33334d")
         self.delay_checkbox = ft.Checkbox(label="Enable client delay [Experimental]", value=False)
 
-        for control in (self.main_id_field, self.attack_target_field, self.fire_distance_field,
-                        self.hook_distance_field, self.target_distance_field, self.hook_delay_field,
-                        self.rescue_radius_field,
-                        self.auto_aim_cb, self.hook_target_cb, self.fire_target_cb,
-                        self.move_cb, self.stand_cb, self.rescue_frozen_cb, self.rescue_all_cb,
-                        self.kill_on_freeze_cb, self.attack_main_cb, self.auto_hammer_cb,
-                        self.stand_on_x_cb):
+        for control in (self.main_id_field, self.attack_target_field,
+                        self.auto_aim_cb, self.hook_target_cb, self.fire_target_cb, self.move_cb, self.stand_cb, self.pathfinder_cb,
+                        self.attack_main_cb, self.kill_on_freeze_cb, self.auto_hammer_cb, self.stand_on_x_cb,
+                        self.fire_distance_field, self.hook_distance_field, self.target_distance_field, self.hook_delay_field, self.main_dist_field, self.stand_dist_field,
+                        self.rescue_frozen_cb, self.rescue_radius_field, self.smart_detect_cb, self.smart_rescue_cb, self.rescue_ids_field,
+                        self.target_coords_field):
             control.on_change = lambda e: self._schedule_attack_config_update()
         self.delay_field.on_change = lambda e: self._send_client_delay()
         self.delay_checkbox.on_change = lambda e: self._send_client_delay()
@@ -2466,19 +2614,56 @@ class DMClientsApp:
                     ft.Text("Enable:", size=14), self.attack_enable_switch,
                     self.main_id_field, self.attack_target_field,
                 ], spacing=10),
-                ft.Row([self.auto_aim_cb, self.hook_target_cb, self.fire_target_cb, self.move_cb, self.stand_cb], spacing=15),
+                ft.Row([self.auto_aim_cb, self.hook_target_cb, self.fire_target_cb, self.move_cb, self.stand_cb, self.pathfinder_cb], spacing=15),
                 ft.Row([self.attack_main_cb, self.kill_on_freeze_cb, self.all_target_cb, self.auto_hammer_cb, self.stand_on_x_cb], spacing=15),
-                ft.Row([self.fire_distance_field, self.hook_distance_field, self.target_distance_field, self.hook_delay_field], spacing=10),
-                ft.Row([self.rescue_frozen_cb, self.rescue_radius_field, self.rescue_all_cb], spacing=10),
+                ft.Row([self.fire_distance_field, self.hook_distance_field, self.target_distance_field, self.hook_delay_field, self.main_dist_field, self.stand_dist_field], spacing=10),
+                ft.Row([self.rescue_frozen_cb, self.rescue_radius_field, self.rescue_all_cb, self.smart_detect_cb, self.smart_rescue_cb, self.rescue_ids_field], spacing=10),
+                ft.Row([self.target_coords_field], spacing=10),
             ], spacing=10),
             padding=10, bgcolor="#1a1a24", border_radius=10
+        )
+
+        self.simulate_players_cb = ft.Checkbox(label="Simulate Players", value=True, tooltip="A* treats players as walls; OFF = IntersectCharacter jump bypass")
+        self.pathfinder_rays_slider = ft.Slider(min=12, max=90, value=24, expand=True,
+                                                on_change=self.on_pathfinder_rays_change, tooltip="Number of rays in pathfinder raycast")
+        self.pathfinder_rays_dist_slider = ft.Slider(min=1, max=128, value=6, expand=True,
+                                                      on_change=self.on_pathfinder_rays_dist_change, tooltip="Max raycast distance for pathfinder")
+        self.pathfinder_snap_cb = ft.Checkbox(label="Fix Snap", value=False, on_change=self.on_pathfinder_snap_change, tooltip="Slightly changes the bot's behavior when it needs to use a jump")
+        self.pathfinder_sps_cb = ft.Checkbox(label="SPS", value=True, tooltip="0 = Players as walls (default), 1 = Players as pushable obstacles", on_change=self.on_pathfinder_sps_change)
+        self.pf_hook_cb = ft.Checkbox(label="Pf Hook [Experimental]", value=False, tooltip="Hook onto hookable blocks while pathfinding (WARNING: EXPERIMENTAL)")
+        self.avoid_freeze_cb = ft.Checkbox(label="Avoid Freeze", value=True, tooltip="Repel from nearby freeze tiles")
+        self.pathfinder_rays_value = ft.Text("24", size=14)
+        self.pathfinder_rays_dist_value = ft.Text("6", size=14)
+        self.pathfinder_go_x = ft.TextField(label="X", expand=True, bgcolor="#1e1e24", border_color="#33334d")
+        self.pathfinder_go_y = ft.TextField(label="Y", expand=True, bgcolor="#1e1e24", border_color="#33334d")
+        self.pathfinder_go_switch = ft.Switch(label="Go", value=False, on_change=self.on_pathfinder_go_toggle)
+
+        pathfinder_go_container = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    self.simulate_players_cb, 
+                    self.pathfinder_snap_cb, 
+                    self.pathfinder_sps_cb, 
+                    self.avoid_freeze_cb, 
+                    self.pf_hook_cb,
+                ], spacing=10),
+                ft.Row([ft.Text("Rays:", size=14), self.pathfinder_rays_slider, self.pathfinder_rays_value, ft.Text("Dist:", size=14), self.pathfinder_rays_dist_slider, self.pathfinder_rays_dist_value], spacing=10),
+                ft.Row([
+                    self.pathfinder_go_x,
+                    self.pathfinder_go_y,
+                    self.pathfinder_go_switch,
+                ], spacing=10),
+            ], spacing=5),
+            padding=10, bgcolor="#1a1a24"
         )
 
         macros_section = self.macro_mgr.build_ui()
 
         self.input_fields = {
             "player_name": player_name_field,
+            "player_clan": player_clan_field,
             "dummy_name": dummy_name_field,
+            "dummy_clan": dummy_clan_field,
             "player_skin": player_skin_field,
             "dummy_skin": dummy_skin_field,
             "connect_server": connect_server_field,
@@ -2514,7 +2699,7 @@ class DMClientsApp:
                 border_radius=10,
                 margin=ft.Margin.only(bottom=10)
             ),
-            ft.Text("Input controls", size=16, weight="bold"),
+            ft.Text("Input controls", size=16, weight="bold", tooltip="Manual bot input: movement, weapon, kill, copy moves"),
             ft.Container(
                 content=ft.Column([
                     ft.Row([self.left_cb, self.right_cb, self.jump_cb, fire_cb, hook_cb], spacing=20, wrap=False),
@@ -2528,7 +2713,7 @@ class DMClientsApp:
                 ], spacing=10),
                 padding=10, bgcolor="#1a1a24", border_radius=10, expand=True,
             ),
-            ft.Text("Aim", size=16, weight="bold"),
+            ft.Text("Aim", size=16, weight="bold", tooltip="Crosshair position control and random aim settings"),
             ft.Container(
                 content=ft.Column([
                     ft.Row([ft.Text("X:", size=14), self.aim_x_slider, self.aim_x_value], spacing=10),
@@ -2537,11 +2722,13 @@ class DMClientsApp:
                 ], spacing=10),
                 padding=10, bgcolor="#1a1a24", border_radius=10
             ),
-            ft.Text("Block", size=16, weight="bold"),
+            ft.Text("Block", size=16, weight="bold", tooltip="Bot behavior: follow main, attack targets, rescue frozen teammates, auto-aim/hook/fire"),
             attack_container,
-            ft.Text("Macros [Experimental]", size=16, weight="bold"),
+            ft.Text("Pathfinder [Experimental]", size=16, weight="bold", tooltip="A* pathfinding to navigate around walls"),
+            pathfinder_go_container,
+            ft.Text("Macros", size=16, weight="bold", tooltip="Record and playback input macros (.inp) or execute rule scripts (.rule) on clients"),
             macros_section,
-            ft.Text("Code Execute [Experimental]", size=16, weight="bold"),
+            ft.Text("Code Execute", size=16, weight="bold", tooltip="Run custom Python code with access to app state, send commands, and control clients dynamically"),
             self.code_executor.build_ui(),
         ], spacing=10, scroll=ft.ScrollMode.AUTO)
 
@@ -2724,7 +2911,7 @@ class DMClientsApp:
         self.spare_count_field = ft.TextField(label="Spare count", value="5", width=80,
                                               bgcolor="#1e1e24", border_color="#33334d")
         self.target_server_field = ft.TextField(label="Target server", value="", width=200,
-                                                bgcolor="#1e1e24", border_color="#33334d")
+                                                bgcolor="#1e1e24", border_color="#33334d", tooltip="The server on which to check the proxy")
 
         try:
             with open("optimal_proxies_new.py", "r", encoding="utf-8") as f:
@@ -2762,6 +2949,8 @@ class DMClientsApp:
                 bottom_row,
                 ft.Text("Proxies", size=16, weight="bold"),
                 proxy_settings,
+                ft.Text("Github: ", selectable=True, spans=[ft.TextSpan("https://github.com/lothiann/DMClients", url="https://github.com/lothiann/DMClients", style=ft.TextStyle(color="#A855F7", size=14))]),
+                ft.Text("Telegram: ", selectable=True, spans=[ft.TextSpan("https://t.me/DMClients", url="https://t.me/DMClients", style=ft.TextStyle(color="#A855F7", size=14))]),
             ], spacing=10, scroll=ft.ScrollMode.AUTO),
             padding=20, expand=True,
             alignment=ft.Alignment(-1, -1),
@@ -2860,6 +3049,16 @@ class DMClientsApp:
         name = self.input_fields.get("dummy_name")
         if name and name.value.strip():
             self.send_action_command(f"dummy_name {name.value.strip()}")
+
+    def on_player_clan_submit(self, e):
+        clan = self.input_fields.get("player_clan")
+        if clan and clan.value.strip():
+            self.send_action_command(f"player_clan {clan.value.strip()}")
+
+    def on_dummy_clan_submit(self, e):
+        clan = self.input_fields.get("dummy_clan")
+        if clan and clan.value.strip():
+            self.send_action_command(f"dummy_clan {clan.value.strip()}")
 
     def on_player_skin_submit(self, e):
         skin = self.input_fields.get("player_skin")
@@ -3045,8 +3244,6 @@ class DMClientsApp:
         return result if result else "-1"
 
     def _send_attack_config(self):
-        if not self.attack_enable_switch.value:
-            return
         main_id = self.main_id_field.value.strip()
         targets_str = self.attack_target_field.value.strip()
         bots_str = self._get_auto_bots_ids()
@@ -3057,33 +3254,61 @@ class DMClientsApp:
         if not targets_str:
             targets_str = "-1"
 
-        auto_aim   = 1 if self.auto_aim_cb.value else 0
-        auto_fire  = 1 if self.fire_target_cb.value else 0
-        auto_hook  = 1 if self.hook_target_cb.value else 0
-        move       = 1 if self.move_cb.value else 0
-        stand      = 1 if self.stand_cb.value else 0
-        rescue     = 1 if self.rescue_frozen_cb.value else 0
-        rescue_all = 1 if self.rescue_all_cb.value else 0
-        kill_frz   = 1 if self.kill_on_freeze_cb.value else 0
-        attack_main= 1 if self.attack_main_cb.value else 0
-        auto_hammer= 1 if self.auto_hammer_cb.value else 0
+        zone_ids = self._compute_zone_target_ids()
+        if zone_ids:
+            manual_ids = set()
+            if targets_str != "-1":
+                for part in targets_str.split(','):
+                    part = part.strip()
+                    if part:
+                        try:
+                            manual_ids.add(int(part))
+                        except ValueError:
+                            pass
+            merged = manual_ids | zone_ids
+            targets_str = ','.join(str(pid) for pid in sorted(merged))
+
+        auto_aim      = 1 if self.auto_aim_cb.value else 0
+        auto_fire     = 1 if self.fire_target_cb.value else 0
+        auto_hook     = 1 if self.hook_target_cb.value else 0
+        move          = 1 if self.move_cb.value else 0
+        stand         = 1 if self.stand_cb.value else 0
+        rescue        = 1 if self.rescue_frozen_cb.value else 0
+        rescue_all    = 1 if self.rescue_all_cb.value else 0
+        kill_frz      = 1 if self.kill_on_freeze_cb.value else 0
+        attack_main   = 1 if self.attack_main_cb.value else 0
+        auto_hammer   = 1 if self.auto_hammer_cb.value else 0
+        smart_detect  = 1 if self.smart_detect_cb.value else 0
+        smart_rescue  = 1 if self.smart_rescue_cb.value else 0
+        sim_players   = 1 if self.simulate_players_cb.value else 0
+        avoid_freeze  = 1 if self.avoid_freeze_cb.value else 0
+        pf_hook       = 1 if self.pf_hook_cb.value else 0
 
         fire_dist     = self.fire_distance_field.value.strip() or "80"
         hook_dist     = self.hook_distance_field.value.strip() or "400"
         rescue_radius = self.rescue_radius_field.value.strip() or "500"
         target_dist   = self.target_distance_field.value.strip() or "300"
         hook_delay    = self.hook_delay_field.value.strip() or "1000"
+        main_dist     = self.main_dist_field.value.strip() or "inf"
+        stand_dist    = self.stand_dist_field.value.strip() or "64"
+        rescue_ids    = self.rescue_ids_field.value.strip() or "-1"
 
         self.send_action_command(f"c_main {main_id}")
         self.send_action_command(f"c_targets {targets_str}")
         if bots_str:
             self.send_action_command(f"c_bots {bots_str}")
         self.send_action_command(f"c_target_all {1 if all_target else 0}")
-        self.send_action_command(f"c_atk_set {auto_aim} {auto_fire} {auto_hook} {move} {stand} {rescue} {rescue_all} {kill_frz} {attack_main} {auto_hammer}")
-        self.send_action_command(f"c_atk_dists {fire_dist} {hook_dist} {rescue_radius} {target_dist}")
+        self.send_action_command(f"c_atk_set {auto_aim} {auto_fire} {auto_hook} {move} {stand} {rescue} {rescue_all} {smart_detect} {smart_rescue} {kill_frz} {attack_main} {auto_hammer} {sim_players} {avoid_freeze} {pf_hook}")
+        self.send_action_command(f"c_atk_dists {fire_dist} {hook_dist} {rescue_radius} {target_dist} {main_dist} {stand_dist}")
         self.send_action_command(f"c_atk_hook_delay {hook_delay}")
+        self.send_action_command(f"c_rescue_ids {rescue_ids}")
         self._send_client_delay()
         self.send_action_command(f"c_stand_on_x {1 if self.stand_on_x_cb.value else 0}")
+        self.send_action_command(f"c_atk_pathfinder {1 if self.pathfinder_cb.value else 0}")
+        self.send_action_command(f"c_atk_pathfinder_rays {int(self.pathfinder_rays_slider.value)}")
+        self.send_action_command(f"c_atk_pathfinder_rays_dist {int(self.pathfinder_rays_dist_slider.value)}")
+        self.send_action_command(f"c_atk_pathfinder_snap {1 if self.pathfinder_snap_cb.value else 0}")
+        self.send_action_command(f"c_atk_pathfinder_sps {1 if self.pathfinder_sps_cb.value else 0}")
 
     def _send_client_delay(self):
         selected = self.get_selected_clients()
@@ -3107,8 +3332,7 @@ class DMClientsApp:
             return
         if self._config_timer:
             self._config_timer.cancel()
-        self._config_timer = threading.Timer(0.3, self._send_attack_config)
-        self._config_timer.start()
+        self._config_timer = _async_timer(0.3, self._send_attack_config)
 
     async def on_attack_toggle(self, e):
         if self.attack_enable_switch.value:
@@ -3128,9 +3352,108 @@ class DMClientsApp:
             self.attack_target_field.label = "Target IDs"
         self.attack_target_field.update()
         self._schedule_attack_config_update()
+    
+        if hasattr(self, 'players_table') and self.players_table:
+            target_column = self.players_table.columns[-1]
+            if self.all_target_cb.value:
+                target_column.label = ft.Text("Untarget", weight="bold")
+            else:
+                target_column.label = ft.Text("Target", weight="bold")
+            self.players_table.update()
+
+    def on_rescue_all_change(self, e):
+        if self.rescue_all_cb.value:
+            self.rescue_ids_field.label = "Unrescue IDs"
+        else:
+            self.rescue_ids_field.label = "Rescue IDs"
+        self.rescue_ids_field.update()
+        self._schedule_attack_config_update()
+
+    def _compute_zone_target_ids(self):
+        """Parse Target Coords field (x1,y1-x2,y2; x3,y3-x4,y4) and return set of player IDs in those zones."""
+        coords_text = self.target_coords_field.value.strip()
+        if not coords_text:
+            return set()
+
+        zones = []
+        for zone_str in coords_text.split(';'):
+            zone_str = zone_str.strip()
+            if not zone_str:
+                continue
+            try:
+                range_part = zone_str.split('-')
+                if len(range_part) != 2:
+                    continue
+                x1y1 = range_part[0].strip().split(',')
+                x2y2 = range_part[1].strip().split(',')
+                if len(x1y1) != 2 or len(x2y2) != 2:
+                    continue
+                x1, y1 = float(x1y1[0]), float(x1y1[1])
+                x2, y2 = float(x2y2[0]), float(x2y2[1])
+                zones.append((min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)))
+            except (ValueError, IndexError):
+                continue
+
+        if not zones:
+            return set()
+
+        all_players = self.bridge_receiver.get_all_players()
+        zone_ids = set()
+        for pid, data in all_players.items():
+            if data.get('is_local'):
+                continue
+            px, py = data.get('x', 0), data.get('y', 0)
+            for (zx1, zy1, zx2, zy2) in zones:
+                if zx1 <= px <= zx2 and zy1 <= py <= zy2:
+                    zone_ids.add(pid)
+                    break
+        return zone_ids
 
     def on_stand_on_x_change(self, e):
         self._schedule_attack_config_update()
+
+    def on_pathfinder_change(self, e):
+        self._schedule_attack_config_update()
+
+    def on_pathfinder_rays_change(self, e):
+        self.pathfinder_rays_value.value = str(int(e.control.value))
+        self.pathfinder_rays_value.update()
+        self._schedule_attack_config_update()
+
+    def on_pathfinder_rays_dist_change(self, e):
+        self.pathfinder_rays_dist_value.value = str(int(e.control.value))
+        self.pathfinder_rays_dist_value.update()
+        self._schedule_attack_config_update()
+
+    def on_pathfinder_snap_change(self, e):
+        self._schedule_attack_config_update()
+
+    def on_pathfinder_sps_change(self, e):
+        self._schedule_attack_config_update()
+
+    def on_pathfinder_go_toggle(self, e):
+        if self.pathfinder_go_switch.value:
+            try:
+                x = int(self.pathfinder_go_x.value.strip())
+                y = int(self.pathfinder_go_y.value.strip())
+                self._send_attack_config()
+                self.send_action_command(f"c_pathfinder_go 1 {x} {y}")
+            except:
+                self.send_action_command("c_pathfinder_go 1")
+            asyncio.create_task(self.monitor_pathfinder_go_status())
+        else:
+            self.send_action_command("c_pathfinder_go 0")
+
+    async def monitor_pathfinder_go_status(self):
+        while self.pathfinder_go_switch.value:
+            await asyncio.sleep(0.5)
+            for cid in self.get_selected_clients():
+                if "Reached destination" in self.client_manager.client_log.get(cid, ""):
+                    self.pathfinder_go_switch.value = False
+                    self.pathfinder_go_switch.update()
+                    self.send_action_command("c_pathfinder_go 0")
+                    self.add_log(f"✅ Client #{cid} reached destination")
+                    break
 
     def on_fix_players_toggle(self, e):
         if self.fix_players_switch.value:
@@ -3204,7 +3527,7 @@ class DMClientsApp:
                 self._loop.call_soon_threadsafe(self.update_clients_stats)
                 self._loop.call_soon_threadsafe(self.page.update)
 
-            threading.Thread(target=launch_with_delay, daemon=True).start()
+            asyncio.create_task(asyncio.to_thread(launch_with_delay))
 
         self.all_clients_btn.update()
         self.update_clients_stats()
@@ -3212,6 +3535,10 @@ class DMClientsApp:
 
     async def players_tab_loop(self):
         weapon_names = {0: "Hammer", 1: "Pistol", 2: "Shotgun", 3: "Rocket", 4: "Laser", 5: "Ninja"}
+    
+        if not hasattr(self, 'target_checkboxes'):
+            self.target_checkboxes = {}
+    
         while True:
             await asyncio.sleep(0.5)
 
@@ -3228,6 +3555,16 @@ class DMClientsApp:
 
             players = self.bridge_receiver.get_all_players()
             rows = []
+        
+            current_targets = set()
+            targets_str = self.attack_target_field.value.strip()
+            if targets_str and targets_str != "-1":
+                for part in targets_str.split(','):
+                    try:
+                        current_targets.add(int(part.strip()))
+                    except:
+                        pass
+        
             for pid, data in players.items():
                 player_type = "Bot" if pid in our_bot_ids else "Player"
                 weapon = data.get('weapon', -1)
@@ -3236,6 +3573,57 @@ class DMClientsApp:
                 target_x = data.get('target_x', 0)
                 target_y = data.get('target_y', 0)
                 aim_str = f"{target_x},{target_y}"
+            
+                def make_checkbox(p_id, current_val):
+                    def on_change(e):
+                        if self.all_target_cb.value:
+                            untarget_ids = set()
+                            current = self.attack_target_field.value.strip()
+                            if current and current != "-1":
+                                for part in current.split(','):
+                                    try:
+                                        untarget_ids.add(int(part.strip()))
+                                    except:
+                                        pass
+                            if e.control.value:
+                                untarget_ids.add(p_id)
+                            else:
+                                untarget_ids.discard(p_id)
+                            if untarget_ids:
+                                new_value = ','.join(str(i) for i in sorted(untarget_ids))
+                            else:
+                                new_value = "-1"
+                            self.attack_target_field.value = new_value
+                        else:
+                            target_ids = set()
+                            current = self.attack_target_field.value.strip()
+                            if current:
+                                for part in current.split(','):
+                                    try:
+                                        target_ids.add(int(part.strip()))
+                                    except:
+                                        pass
+                            if e.control.value:
+                                target_ids.add(p_id)
+                            else:
+                                target_ids.discard(p_id)
+                            if target_ids:
+                                new_value = ','.join(str(i) for i in sorted(target_ids))
+                            else:
+                                new_value = ""
+                            self.attack_target_field.value = new_value
+        
+                        self.attack_target_field.update()
+                        self._schedule_attack_config_update()
+    
+                    return on_change
+            
+                cb = ft.Checkbox(
+                    value=pid in current_targets,
+                    on_change=make_checkbox(pid, pid in current_targets)
+                )
+                self.target_checkboxes[pid] = cb
+            
                 rows.append(ft.DataRow(cells=[
                     ft.DataCell(ft.Text(data.get('name', '')[:20])),
                     ft.DataCell(ft.Text(str(pid))),
@@ -3251,10 +3639,19 @@ class DMClientsApp:
                     ft.DataCell(ft.Text(str(data.get('angle', 0)))),
                     ft.DataCell(ft.Text(str(data.get('attack_tick', 0)))),
                     ft.DataCell(ft.Text(aim_str)),
+                    ft.DataCell(cb),
                 ]))
+        
             if self.players_table:
                 self.players_table.rows = rows
                 self.players_table.update()
+        
+            target_column = self.players_table.columns[-1]
+            if self.all_target_cb.value:
+                target_column.label = ft.Text("Untarget", weight="bold")
+            else:
+                target_column.label = ft.Text("Target", weight="bold")
+            self.players_table.update()
 
     def on_semicolon_switch_change(self, e):
         self.add_semicolons = e.control.value
@@ -3276,6 +3673,7 @@ class DMClientsApp:
         if idx == 0:
             self.console_container.visible = True
             self.page.run_task(self.page.input_field.focus)
+            asyncio.create_task(self.log_box.scroll_to(offset=-1, duration=0))
         elif idx == 1:
             self.clients_container.visible = True
         elif idx == 2:
@@ -3348,7 +3746,7 @@ class DMClientsApp:
                 if was_bridge_running:
                     self.bridge_receiver.start()
                     self.add_log("▶️ Bridge Receiver restarted")
-        threading.Thread(target=read_output, daemon=True).start()
+        asyncio.create_task(asyncio.to_thread(read_output))
 
     def fast_proxies(self, e):
         import random
@@ -3427,7 +3825,8 @@ class DMClientsApp:
                     json.dump(config, f)
                 proc = subprocess.Popen(["xray.exe", "-c", cfg_file],
                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        creationflags=subprocess.CREATE_NO_WINDOW)
+                                        creationflags=subprocess.CREATE_NO_WINDOW,
+                                        errors='replace')
                 time.sleep(0.8)
                 proxies = {"http": f"socks5://127.0.0.1:{port}", "https": f"socks5://127.0.0.1:{port}"}
                 start = time.time()
@@ -3525,7 +3924,7 @@ class DMClientsApp:
             self.add_log(f"💾 Saved {len(proxies_list)} fast proxies to {json_path}")
             self._refresh_proxies_table()
 
-        threading.Thread(target=run_fast_proxies, daemon=True).start()
+        asyncio.create_task(asyncio.to_thread(run_fast_proxies))
 
     def toggle_proxies(self, e):
         btn = e.control
@@ -3557,7 +3956,8 @@ class DMClientsApp:
                 [sys.executable, "-u", ports_script],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, bufsize=1, encoding='utf-8', env=env,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+                errors='replace'
             )
             self.ports_proxies_proc = proc_ports
             def read_ports():
@@ -3574,7 +3974,7 @@ class DMClientsApp:
                     self.add_log(f"[PortsProxies] Finished (code {proc_ports.returncode})")
                     if getattr(self, 'ports_proxies_proc', None) == proc_ports:
                         self.ports_proxies_proc = None
-            threading.Thread(target=read_ports, daemon=True).start()
+            asyncio.create_task(asyncio.to_thread(read_ports))
             proxifyre_path = os.path.join(os.path.dirname(__file__), "ProxiFyre", "ProxiFyre.exe")
             if os.path.exists(proxifyre_path):
                 try:
@@ -3601,7 +4001,7 @@ class DMClientsApp:
                             self.add_log(f"[ProxiFyre] Finished (code {proc_prox.returncode})")
                             if getattr(self, 'proxifyre_proc', None) == proc_prox:
                                 self.proxifyre_proc = None
-                    threading.Thread(target=read_proxifyre, daemon=True).start()
+                    asyncio.create_task(asyncio.to_thread(read_proxifyre))
                 except Exception as ex:
                     self.add_log(f"[ProxiFyre] Start error: {ex}")
             else:

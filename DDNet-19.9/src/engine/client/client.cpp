@@ -1217,6 +1217,7 @@ const char *CClient::LoadMap(const char *pName, const char *pFilename, const std
 
 	char aBuf[256];
 	str_format(aBuf, sizeof(aBuf), "loaded map '%s'", pFilename);
+	m_BotNet.LoadMapGrid();
 	m_pConsole->Print(IConsole::OUTPUT_LEVEL_ADDINFO, "client", aBuf);
 
 	return nullptr;
