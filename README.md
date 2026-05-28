@@ -20,7 +20,7 @@
       - [Input controls](#input-controls)
       - [Aim](#aim)
       - [Block](#block)
-      - [Pathfinder](#pathfinder)
+      - [Pathfinder](#pathfinder-experimental)
       - [Macros & Rules](#macros--rules)
       - [Code Execute](#code-execute)
     - [Tab](#tab)
@@ -166,8 +166,6 @@ Configure automated targeting and movement for all selected clients.
 | Stand dist | Don't move if within N units of target/main (default: 64) |
 
 All settings are debounced and sent together via `c_atk_set`, `c_atk_dists`, `c_atk_hook_delay`, `c_main`, `c_targets`, `c_bots`, `c_target_all`.
-
----
 
 #### Pathfinder (Experimental)
 
