@@ -139,24 +139,52 @@ Configure automated targeting and movement for all selected clients.
 | Enable | Master toggle — sends `c_attack 1/0` |
 | Main ID | Your main player ID (`c_main <id>`) |
 | Target IDs | Comma-separated IDs to attack; or untargeted IDs if **All target** is on |
+| Rescue IDs | Specific IDs to rescue (or unrescue if Rescue all is on) |
+| Target Coords | Auto-target players in zones: `x1,y1-x2,y2; x3,y3-x4,y4` |
 | Auto aim | Aim at target automatically |
 | Hook | Hook the target |
 | Fire | Fire at the target |
 | Move | Allow movement |
-| Stand | Stand still |
+| Stand | Stand still within Stand dist radius |
+| Pathfinder | Use A* pathfinding to navigate around obstacles |
 | Attack main | Also attack the main player |
-| Kill on freeze | Send `kill` when the client is frozen |
+| Kill on freeze | Auto respawn (`kill; say /kill`) when frozen |
 | Rescue frozen | Hook frozen teammates within rescue radius |
-| Rescue all | Rescue all frozen (not just teammates) |
-| Auto hammer | Automatically switch to and use hammer |
-| Stand on X only | Maintain only X-axis position |
-| Fire dist | Distance to start firing |
-| Hook dist | Distance to start hooking |
-| Hook delay | Delay between hook attempts (ms) |
-| Target dist | Maximum distance to consider a target |
-| Rescue radius | Radius to search for frozen players to rescue |
+| Rescue all | Rescue all frozen players (not just teammates) |
+| Smart Detect | Find frozen players without line of sight |
+| Smart Rescue | Use pathfinder to reach frozen players in rescue radius |
+| Auto hammer | Automatically switch to hammer when attacking |
+| Stand on X only | Maintain only X-axis position (experimental) |
+| All target | Target all players (Target IDs become exclusion list) |
+| Fire dist | Distance to start firing (default: 65) |
+| Hook dist | Distance to start hooking (default: 400) |
+| Target dist | Max distance to consider a target (default: 300) |
+| Rescue radius | Radius to search for frozen players (default: 500) |
+| Hook delay | Delay between hook attempts (ms, default: 1000) |
+| Main dist | Radius to go to main (`inf` = unlimited) |
+| Stand dist | Don't move if within N units of target/main (default: 64) |
 
 All settings are debounced and sent together via `c_atk_set`, `c_atk_dists`, `c_atk_hook_delay`, `c_main`, `c_targets`, `c_bots`, `c_target_all`.
+
+---
+
+#### Pathfinder (Experimental)
+
+A* pathfinding to navigate around walls and obstacles.
+
+| Setting | Description |
+|---------|-------------|
+| Simulate Players | Players treated as walls (OFF = intersect character jump bypass) |
+| Fix Snap | Slightly changes bot behavior when needing to jump |
+| SPS | 0 = Players as walls, 1 = Players as pushable obstacles |
+| Pf Hook (Experimental) | Hook onto hookable blocks while pathfinding |
+| Avoid Freeze | Repel from nearby freeze tiles |
+| Rays | Number of rays in raycast (12–90, default: 24) |
+| Ray Dist | Max raycast distance (1–128, default: 6) |
+| Go X / Y | Target coordinates for pathfinder |
+| Go Switch | Enable pathfinder movement to target coordinates |
+
+When destination reached, switch automatically turns off.
 
 ---
 
@@ -373,6 +401,14 @@ Commands sent through the Control Server to clients:
 | `c_atk_set <...>` | Set attack flags (aim, fire, hook, move, stand, rescue, rescue_all, kill_frz, atk_main, hammer) |
 | `c_atk_dists <fire> <hook> <rescue> <target>` | Set attack distances |
 | `c_atk_hook_delay <ms>` | Set hook delay in ms |
+| `c_atk_pathfinder <0/1>` | Enable/disable pathfinding in attack mode |
+| `c_atk_pathfinder_rays <n>` | Set number of pathfinder rays |
+| `c_atk_pathfinder_rays_dist <n>` | Set pathfinder ray distance |
+| `c_atk_pathfinder_snap <0/1>` | Toggle snap behavior |
+| `c_atk_pathfinder_sps <0/1>` | Toggle SPS mode |
+| `c_pathfinder_go <0/1> [x y]` | Move to coordinates using pathfinder |
+| `c_rescue_ids <ids>` | Set specific IDs to rescue/unrescue |
+| `c_stand_on_x <0/1>` | Hold X position only |
 | `c_copy_moves <id>` | Mirror inputs from player with given in-game ID (-1 to disable) |
 | `c_client_delay <ms>` | Delay all inputs by N ms (experimental) |
 | `c_stand_on_x <0/1>` | Hold X position only |
