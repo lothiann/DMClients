@@ -20,6 +20,7 @@
       - [Input controls](#input-controls)
       - [Aim](#aim)
       - [Block](#block)
+      - [Pathfinder](#pathfinder)
       - [Macros & Rules](#macros--rules)
       - [Code Execute](#code-execute)
     - [Tab](#tab)
