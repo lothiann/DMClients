@@ -17,20 +17,8 @@ def patch_script(src, dst):
     with open(src, 'r', encoding='utf-8') as f:
         c = f.read()
     c = c.replace(
-        'os.path.dirname(__file__)',
-        'os.path.dirname(sys.executable)'
-    )
-    c = c.replace(
-        'os.path.dirname(os.path.dirname(__file__))',
-        'os.path.dirname(os.path.dirname(sys.executable))'
-    )
-    c = c.replace(
-        'os.path.dirname(os.path.abspath(__file__))',
-        'os.path.dirname(sys.executable)'
-    )
-    c = c.replace(
-        'os.path.join(os.path.dirname(__file__)',
-        'os.path.join(os.path.dirname(sys.executable))'
+        '__file__', 
+        'sys.argv[0]'
     )
     c = c.replace(
         'optimal_proxies_new.py',

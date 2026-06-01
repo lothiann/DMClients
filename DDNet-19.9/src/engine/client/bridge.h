@@ -2,6 +2,7 @@
 #define ENGINE_CLIENT_BRIDGE_H
 
 #include <base/vmath.h>
+
 #include <string>
 
 class IConsole;
@@ -20,11 +21,16 @@ private:
 
 	IGameClient *m_pGameClient;
 	IClient *m_pClient;
+	IConsole *m_pConsole;
 
 	int64_t m_LastSendTime;
+	int64_t m_LastReconnectAttempt;
 	std::string m_CommandBuffer;
+	std::string m_Token;
 
 	void SendGameState();
+	bool TryConnectControl();
+	bool TryConnectBridge();
 
 public:
 	CBridge();

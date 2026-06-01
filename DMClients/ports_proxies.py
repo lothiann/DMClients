@@ -36,17 +36,96 @@ if sys.platform == 'win32':
         print("="*60)
         time.sleep(3)
 
+def parse_key(key: str) -> dict | None:
+    try:
+        from python_v2ray.config_parser import parse_uri
+
+        if key.startswith("socks5://"):
+            key = "socks://" + key[len("socks5://"):]
+
+        p = parse_uri(key)
+        if p is None:
+            return None
+        server = getattr(p, "address", None) or getattr(p, "server", None) or getattr(p, "host", None)
+        if not server:
+            return None
+
+        if p.protocol in ("vless", "vmess"):
+            ob = {
+                "protocol": p.protocol,
+                "settings": {"vnext": [{"address": server, "port": p.port,
+                    "users": [{"id": getattr(p, "id", getattr(p, "uuid", "")),
+                               "encryption": getattr(p, "encryption", "none"),
+                               "flow": getattr(p, "flow", "")}]}]},
+                "streamSettings": {"network": getattr(p, "network", "tcp"),
+                                   "security": getattr(p, "security", "none")}
+            }
+            sec = getattr(p, "security", "")
+            if sec == "reality":
+                ob["streamSettings"]["realitySettings"] = {
+                    "serverName": getattr(p, "sni", ""), "fingerprint": "chrome",
+                    "publicKey": getattr(p, "pbk", ""), "shortId": getattr(p, "sid", ""),
+                    "spiderX": "/"}
+            elif sec == "tls":
+                ob["streamSettings"]["tlsSettings"] = {
+                    "serverName": getattr(p, "sni", server), "allowInsecure": True}
+            return ob
+
+        if p.protocol in ("shadowsocks", "ss"):
+            return {"protocol": "shadowsocks",
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                        "method": getattr(p, "method", "chacha20-ietf-poly1305"),
+                        "password": getattr(p, "password", "")}]}}
+
+        if p.protocol == "trojan":
+            return {"protocol": "trojan",
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                        "password": getattr(p, "password", getattr(p, "uuid", ""))}]},
+                    "streamSettings": {"security": "tls",
+                        "tlsSettings": {"serverName": getattr(p, "sni", server),
+                                        "allowInsecure": True}}}
+
+        if p.protocol in ("hysteria", "hysteria2"):
+            return {"protocol": p.protocol,
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                        "password": getattr(p, "password", getattr(p, "auth", ""))}]},
+                    "streamSettings": {"network": "tcp", "security": "tls",
+                        "tlsSettings": {"serverName": getattr(p, "sni", server),
+                                        "allowInsecure": True}}}
+
+        if p.protocol == "socks":
+            users = []
+            user = getattr(p, "id", "")
+            passwd = getattr(p, "password", "")
+            if user:
+                users.append({"user": user, "pass": passwd})
+            return {"protocol": "socks",
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                                               "users": users}]}}
+
+        print(f"⚠️ Unsupported protocol: {p.protocol}")
+        return None
+    except Exception as e:
+        print(f"⚠️ Parse error: {e}")
+        return None
+
+
 def start_proxy(proxy_config):
-    from python_v2ray.config_parser import parse_uri
-
-    parsed = parse_uri(proxy_config["key"])
     port = proxy_config["port"]
+    key = proxy_config["key"]
 
-    server = getattr(parsed, 'address', None) or getattr(parsed, 'server', None) or getattr(parsed, 'host', 'unknown')
+    outbound = parse_key(key)
+    if outbound is None:
+        print(f"\n⚠️ Skipping port {port} — failed to parse key")
+        return None
+
+    server = outbound.get("settings", {}).get("vnext", [{}])[0].get("address", 
+             outbound.get("settings", {}).get("servers", [{}])[0].get("address", "unknown"))
+    proto = outbound.get("protocol", "?")
 
     print(f"\nStarting proxy on port {port}")
-    print(f"   Type: {parsed.protocol}")
-    print(f"   Address: {server}:{parsed.port}")
+    print(f"   Type: {proto}")
+    print(f"   Address: {server}")
 
     inbound = {
         "port": port,
@@ -55,71 +134,6 @@ def start_proxy(proxy_config):
         "settings": {"auth": "noauth", "udp": True},
         "sniffing": {"enabled": True, "destOverride": ["http", "tls"]}
     }
-
-    if parsed.protocol in ['vless', 'vmess']:
-        outbound = {
-            "protocol": parsed.protocol,
-            "settings": {
-                "vnext": [{
-                    "address": server,
-                    "port": parsed.port,
-                    "users": [{
-                        "id": getattr(parsed, 'id', getattr(parsed, 'uuid', '')),
-                        "encryption": getattr(parsed, 'encryption', 'none'),
-                        "flow": getattr(parsed, 'flow', '')
-                    }]
-                }]
-            },
-            "streamSettings": {
-                "network": getattr(parsed, 'network', 'tcp'),
-                "security": getattr(parsed, 'security', 'none'),
-            }
-        }
-        if getattr(parsed, 'security', '') == 'reality':
-            outbound['streamSettings']['realitySettings'] = {
-                "serverName": getattr(parsed, 'sni', ''),
-                "fingerprint": getattr(parsed, 'fingerprint', 'chrome'),
-                "publicKey": getattr(parsed, 'pbk', ''),
-                "shortId": getattr(parsed, 'sid', ''),
-                "spiderX": "/"
-            }
-
-    elif parsed.protocol in ['shadowsocks', 'ss']:
-        outbound = {
-            "protocol": "shadowsocks",
-            "settings": {
-                "servers": [{
-                    "address": server,
-                    "port": parsed.port,
-                    "method": getattr(parsed, 'method', 'chacha20-ietf-poly1305'),
-                    "password": getattr(parsed, 'password', ''),
-                }]
-            }
-        }
-
-    elif parsed.protocol == 'trojan':
-        outbound = {
-            "protocol": "trojan",
-            "settings": {
-                "servers": [{
-                    "address": server,
-                    "port": parsed.port,
-                    "password": getattr(parsed, 'password', getattr(parsed, 'uuid', ''))
-                }]
-            },
-            "streamSettings": {
-                "network": getattr(parsed, 'network', 'tcp'),
-                "security": getattr(parsed, 'security', 'tls'),
-                "tlsSettings": {
-                    "serverName": getattr(parsed, 'sni', server),
-                    "allowInsecure": True
-                }
-            }
-        }
-
-    else:
-        print(f"⚠️ Protocol {parsed.protocol} is not supported")
-        return None
 
     config = {
         "log": {"loglevel": "info"},

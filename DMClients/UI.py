@@ -16,6 +16,9 @@ import math
 import json
 import shutil
 import ast
+import multiprocessing
+import struct
+import queue as queue_module
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -23,12 +26,40 @@ _global_names = []
 _global_dictionary = []
 _show_advanced_logs = False
 
-def _async_timer(delay: float, callback, *args):
-    """threading.Timer replacement using asyncio — returns asyncio.Task."""
+_main_loop: asyncio.AbstractEventLoop | None = None
+
+def _async_timer(delay: float, callback, *args, loop=None):
     async def _wait():
-        await asyncio.sleep(delay)
-        callback(*args)
-    return asyncio.create_task(_wait())
+        try:
+            await asyncio.sleep(delay)
+            callback(*args)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
+    target_loop = loop or _main_loop
+    if target_loop is None:
+        return None
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            try:
+                running_loop = asyncio.get_running_loop()
+                if running_loop is target_loop:
+                    return running_loop.create_task(_wait())
+            except RuntimeError:
+                pass
+        task_box = []
+        def _create():
+            try:
+                task_box.append(target_loop.create_task(_wait()))
+            except Exception:
+                pass
+        target_loop.call_soon_threadsafe(_create)
+        return task_box[0] if task_box else None
+    except Exception:
+        return None
 
 # ========== HELPER FUNCTIONS ==========
 class DotDict:
@@ -46,140 +77,186 @@ def kill_process_tree(pid: int):
     except psutil.NoSuchProcess:
         pass
 
-# ========== BRIDGE PROTOCOL ==========
-class BridgeProtocol(asyncio.Protocol):
-    def __init__(self, receiver):
-        self.receiver = receiver
-        self.transport = None
-        self.buffer = ""
-        self.client_idx = None
+# ========== SERVER PROCESS (Bridge + Control in separate process) ==========
 
-    def connection_made(self, transport):
-        self.transport = transport
-        client_port = transport.get_extra_info('peername')[1]
-        with self.receiver.lock:
-            self.client_idx = self.receiver.next_client_idx
-            self.receiver.next_client_idx += 1
-            self.receiver.clients[self.client_idx] = self
-            self.receiver.client_ports[self.client_idx] = client_port
-        self.receiver._log(f"Client #{self.client_idx} connected (port {client_port})")
+_MAX_CLIENT_QUEUE = 2000
 
-    def data_received(self, data):
-        self.buffer += data.decode('utf-8', errors='replace')
-        while '\n' in self.buffer:
-            line, self.buffer = self.buffer.split('\n', 1)
-            line = line.strip()
-            if line:
-                self.receiver._parse_line(line, self.client_idx)
-
-    def connection_lost(self, exc):
-        with self.receiver.lock:
-            self.receiver.clients.pop(self.client_idx, None)
-            self.receiver.client_ports.pop(self.client_idx, None)
-            self.receiver.client_local_ids.pop(self.client_idx, None)
-            for token, idx in list(self.receiver.client_token.items()):
-                if idx == self.client_idx:
-                    del self.receiver.client_token[token]
-                    break
-        self.receiver._log(f"Client #{self.client_idx} disconnected")
-
-    def send(self, data: str):
-        if self.transport and not self.transport.is_closing():
-            self.transport.write((data + "\n").encode('utf-8'))
-
-# ========== BRIDGE RECEIVER ==========
-class BridgeReceiver:
-    def __init__(self, host='127.0.0.1', port=5556):
-        self.host = host
-        self.port = port
-        self.running = False
-        self._server = None
-        self.clients: Dict[int, BridgeProtocol] = {}
-        self.client_ports: Dict[int, int] = {}
-        self.players: Dict[int, dict] = {}
-        self.client_local_ids: Dict[int, int] = {}
-        self.client_token: Dict[str, int] = {}
-        self.lock = threading.Lock()
-        self.log_callback = None
-        self.token_callback = None
-        self.next_client_idx = 1
-        self.app = None
-
-        self.server_name = ""
-        self.server_map = ""
-        self.server_gametype = ""
-        self.server_num_players = 0
-        self.server_max_players = 0
-
-    def set_log_callback(self, callback):
-        self.log_callback = callback
-
-    def set_token_callback(self, callback):
-        self.token_callback = callback
-
-    def _log(self, msg: str):
-        if self.log_callback:
-            self.log_callback(f"[Bridge] {msg}")
-
-    async def _start_async(self):
-        loop = asyncio.get_event_loop()
-        self._server = await loop.create_server(
-            lambda: BridgeProtocol(self),
-            self.host, self.port
-        )
-        self.running = True
-        self._log(f"Server listening on {self.host}:{self.port}")
-
-    def start(self) -> bool:
-        if self.running:
-            return False
+def _server_process(control_port, bridge_port, cmd_queue, event_queue, shared_state):
+    if sys.platform == "win32":
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.create_task(self._start_async())
-            else:
-                loop.run_until_complete(self._start_async())
-            return True
-        except Exception as e:
-            self._log(f"Failed to start: {e}")
-            return False
+            import winloop
+            winloop.install()
+        except ImportError:
+            pass
+    asyncio.run(_server_process_async(control_port, bridge_port, cmd_queue, event_queue, shared_state))
 
-    def stop(self):
-        self.running = False
-        if self._server:
-            self._server.close()
-            self._server = None
-        self._log("Server stopped")
 
-    def _parse_line(self, line: str, client_idx: int):
+async def _server_process_async(control_port, bridge_port, cmd_queue, event_queue, shared_state):
+    control_clients = {}  # cid -> ControlProc
+    control_client_ports = {}  # cid -> port
+    control_writer_tasks = {}  # cid -> asyncio.Task
+    bridge_clients = {}  # cidx -> BridgeProc
+    bridge_client_ports = {}  # cidx -> port
+    bridge_local_ids = {}  # cidx -> pid
+    bridge_token_map = {}  # token -> cidx
+    players = {}  # pid -> data
+    server_info = {"name": "", "map": "", "gametype": "", "num_players": 0, "max_players": 0}
+    _sync_dirty = [False]  # flag: True when state needs pushing
+
+    next_control_id = [1]
+    next_bridge_idx = [1]
+
+    class ControlProc(asyncio.Protocol):
+        def __init__(self):
+            self.transport = None
+            self.buffer = ""
+            self.cid = None
+            self.write_queue = asyncio.Queue(maxsize=_MAX_CLIENT_QUEUE)
+
+        def connection_made(self, transport):
+            nonlocal next_control_id
+            self.transport = transport
+            transport.set_write_buffer_limits(high=262144)
+            client_port = transport.get_extra_info('peername')[1]
+            self.cid = next_control_id[0]
+            next_control_id[0] += 1
+            control_clients[self.cid] = self
+            control_client_ports[self.cid] = client_port
+            control_writer_tasks[self.cid] = asyncio.create_task(self._writer_loop())
+            _mark_dirty()
+            try:
+                event_queue.put_nowait(('log', f"[ControlServer] Client #{self.cid} connected (port {client_port})"))
+            except Exception:
+                pass
+
+        def data_received(self, data):
+            self.buffer += data.decode('utf-8', errors='replace')
+            while '\n' in self.buffer:
+                line, self.buffer = self.buffer.split('\n', 1)
+                line = line.strip()
+                if line.startswith("TOKEN "):
+                    token = line[6:].strip()
+                    try:
+                        event_queue.put_nowait(('token_control', self.cid, token))
+                    except Exception:
+                        pass
+
+        def connection_lost(self, exc):
+            control_clients.pop(self.cid, None)
+            control_client_ports.pop(self.cid, None)
+            writer = control_writer_tasks.pop(self.cid, None)
+            if writer and not writer.done():
+                writer.cancel()
+            _mark_dirty()
+            try:
+                event_queue.put_nowait(('log', f"[ControlServer] Client #{self.cid} disconnected"))
+            except Exception:
+                pass
+
+        def enqueue_send(self, data: str):
+            try:
+                self.write_queue.put_nowait(data)
+            except asyncio.QueueFull:
+                try:
+                    event_queue.put_nowait(('log', f"[ControlServer] Client #{self.cid} write queue full — dropping"))
+                except Exception:
+                    pass
+                if self.transport and not self.transport.is_closing():
+                    self.transport.close()
+
+        async def _writer_loop(self):
+            try:
+                while True:
+                    data = await self.write_queue.get()
+                    if self.transport and not self.transport.is_closing():
+                        try:
+                            self.transport.write((data + "\n").encode('utf-8'))
+                        except Exception:
+                            pass
+                    else:
+                        while not self.write_queue.empty():
+                            try:
+                                self.write_queue.get_nowait()
+                            except Exception:
+                                break
+                        return
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+    class BridgeProc(asyncio.Protocol):
+        def __init__(self):
+            self.transport = None
+            self.buffer = ""
+            self.cidx = None
+
+        def connection_made(self, transport):
+            self.transport = transport
+            client_port = transport.get_extra_info('peername')[1]
+            self.cidx = next_bridge_idx[0]
+            next_bridge_idx[0] += 1
+            bridge_clients[self.cidx] = self
+            bridge_client_ports[self.cidx] = client_port
+            _mark_dirty()
+            try:
+                event_queue.put_nowait(('log', f"[Bridge] Client #{self.cidx} connected (port {client_port})"))
+            except Exception:
+                pass
+
+        def data_received(self, data):
+            self.buffer += data.decode('utf-8', errors='replace')
+            while '\n' in self.buffer:
+                line, self.buffer = self.buffer.split('\n', 1)
+                line = line.strip()
+                if line:
+                    _parse_bridge_line(line, self.cidx)
+
+        def connection_lost(self, exc):
+            bridge_clients.pop(self.cidx, None)
+            bridge_client_ports.pop(self.cidx, None)
+            bridge_local_ids.pop(self.cidx, None)
+            for token, idx in list(bridge_token_map.items()):
+                if idx == self.cidx:
+                    del bridge_token_map[token]
+                    break
+            _mark_dirty()
+            try:
+                event_queue.put_nowait(('log', f"[Bridge] Client #{self.cidx} disconnected"))
+            except Exception:
+                pass
+
+        def send(self, data: str):
+            if self.transport and not self.transport.is_closing():
+                self.transport.write((data + "\n").encode('utf-8'))
+
+    def _parse_bridge_line(line: str, cidx: int):
         if line.startswith("TOKEN "):
             token = line[6:].strip()
-            with self.lock:
-                for t, idx in list(self.client_token.items()):
-                    if idx == client_idx:
-                        del self.client_token[t]
-                        break
-                self.client_token[token] = client_idx
-            if _show_advanced_logs:
-                self._log(f"Client #{client_idx} token: {token[:8]}...")
-            if self.token_callback:
-                self.token_callback(token, client_idx)
-                if self.app:
-                    self.app.sync_clients_by_pid()
+            for t, idx in list(bridge_token_map.items()):
+                if idx == cidx:
+                    del bridge_token_map[t]
+                    break
+            bridge_token_map[token] = cidx
+            _mark_dirty()
+            try:
+                event_queue.put_nowait(('token_bridge', token, cidx))
+            except Exception:
+                pass
             return
 
         if line.startswith("SERVER "):
             parts = line.split('"')
             if len(parts) >= 7:
-                self.server_name = parts[1]
-                self.server_map = parts[3]
-                self.server_gametype = parts[5]
+                server_info["name"] = parts[1]
+                server_info["map"] = parts[3]
+                server_info["gametype"] = parts[5]
                 numbers = parts[6].strip().split()
                 if len(numbers) >= 2:
-                    self.server_num_players = int(numbers[0])
-                    self.server_max_players = int(numbers[1])
-            with self.lock:
-                self.players.clear()
+                    server_info["num_players"] = int(numbers[0])
+                    server_info["max_players"] = int(numbers[1])
+            players.clear()
+            _mark_dirty()
             return
 
         if not line.startswith("PLAYER "):
@@ -218,112 +295,241 @@ class BridgeReceiver:
                 target_x = int(right_part[13])
                 target_y = int(right_part[14])
 
-            with self.lock:
-                self.players[pid] = {
-                    'x': x, 'y': y, 'is_local': is_local, 'frozen': frozen,
-                    'name': name, 'weapon': weapon, 'health': health, 'team': team,
-                    'armor': armor, 'direction': direction, 'jumped': jumped,
-                    'hook_state': hook_state, 'angle': angle, 'attack_tick': attack_tick,
-                    'target_x': target_x, 'target_y': target_y,
-                }
-                if is_local:
-                    self.client_local_ids[client_idx] = pid
-        except Exception as e:
-            if self.log_callback:
-                self.log_callback(f"[Bridge] Parse error: {e} on line: {line}")
+            players[pid] = {
+                'x': x, 'y': y, 'is_local': is_local, 'frozen': frozen,
+                'name': name, 'weapon': weapon, 'health': health, 'team': team,
+                'armor': armor, 'direction': direction, 'jumped': jumped,
+                'hook_state': hook_state, 'angle': angle, 'attack_tick': attack_tick,
+                'target_x': target_x, 'target_y': target_y,
+            }
+            if is_local:
+                bridge_local_ids[cidx] = pid
+            _mark_dirty()
+        except Exception:
+            pass
+
+    def _mark_dirty():
+        _sync_dirty[0] = True
+
+    def _sync_shared_state():
+        try:
+            shared_state['control_clients'] = list(control_clients.keys())
+            shared_state['control_client_ports'] = dict(control_client_ports)
+            shared_state['bridge_clients'] = list(bridge_clients.keys())
+            shared_state['bridge_client_ports'] = dict(bridge_client_ports)
+            shared_state['bridge_local_ids'] = dict(bridge_local_ids)
+            shared_state['bridge_token_map'] = dict(bridge_token_map)
+            shared_state['players'] = dict(players)
+            shared_state['server_info'] = dict(server_info)
+        except Exception:
+            pass
+
+    async def _periodic_sync():
+        while True:
+            await asyncio.sleep(0.05)
+            if _sync_dirty[0]:
+                _sync_dirty[0] = False
+                await asyncio.to_thread(_sync_shared_state)
+
+    def _random_char() -> str:
+        import random, string
+        return random.choice(string.ascii_letters + string.digits + "._-")
+
+    def _replace_placeholders(cmd: str, client_index: int) -> str:
+        online = sorted(control_clients.keys())
+        rank = online.index(client_index) + 1 if client_index in online else client_index
+        cmd = cmd.replace("{i}", str(rank))
+
+        while "{r}" in cmd:
+            cmd = cmd.replace("{r}", _random_char(), 1)
+
+        def replace_ri(match):
+            max_val = int(match.group(1))
+            return str(random.randint(0, max_val))
+        cmd = re.sub(r'{ri-(\d+)}', replace_ri, cmd)
+
+        while "{n}" in cmd:
+            if _global_names:
+                cmd = cmd.replace("{n}", random.choice(_global_names), 1)
+            else:
+                cmd = cmd.replace("{n}", "lol", 1)
+
+        while "{d}" in cmd:
+            if _global_dictionary:
+                cmd = cmd.replace("{d}", random.choice(_global_dictionary), 1)
+            else:
+                cmd = cmd.replace("{d}", "lol", 1)
+
+        while "{c}" in cmd:
+            ch = chr(random.randint(0x4E00, 0x9FFF))
+            cmd = cmd.replace("{c}", ch, 1)
+
+        return cmd
+
+    # --- Start servers ---
+    loop = asyncio.get_running_loop()
+
+    control_server = await loop.create_server(ControlProc, '127.0.0.1', control_port)
+    bridge_server = await loop.create_server(BridgeProc, '127.0.0.1', bridge_port)
+
+    try:
+        event_queue.put_nowait(('log', f"[ServerProcess] Control on :{control_port}, Bridge on :{bridge_port}"))
+    except Exception:
+        pass
+
+    # --- Command polling (non-blocking per-client dispatch) ---
+    async def _poll_commands():
+        while True:
+            try:
+                for _ in range(100):
+                    try:
+                        msg = cmd_queue.get_nowait()
+                    except Exception:
+                        break
+
+                    if msg[0] == 'send':
+                        _, cid_list, command = msg
+                        for cid in cid_list:
+                            proto = control_clients.get(cid)
+                            if proto:
+                                final_cmd = _replace_placeholders(command, cid)
+                                proto.enqueue_send(final_cmd)
+                    elif msg[0] == 'remove':
+                        _, cid = msg
+                        proto = control_clients.pop(cid, None)
+                        control_client_ports.pop(cid, None)
+                        writer = control_writer_tasks.pop(cid, None)
+                        if writer and not writer.done():
+                            writer.cancel()
+                        if proto and proto.transport:
+                            try:
+                                proto.transport.close()
+                            except Exception:
+                                pass
+                        _mark_dirty()
+                    elif msg[0] == 'stop':
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.002)
+
+    poll_task = asyncio.create_task(_poll_commands())
+    sync_task = asyncio.create_task(_periodic_sync())
+
+    try:
+        await asyncio.gather(
+            control_server.serve_forever(),
+            bridge_server.serve_forever(),
+            poll_task,
+            sync_task,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        for task in control_writer_tasks.values():
+            if not task.done():
+                task.cancel()
+        sync_task.cancel()
+        control_server.close()
+        bridge_server.close()
+        await control_server.wait_closed()
+        await bridge_server.wait_closed()
+
+
+# ========== BRIDGE RECEIVER (proxy to server process) ==========
+class BridgeReceiver:
+    def __init__(self, host='127.0.0.1', port=5556):
+        self.host = host
+        self.port = port
+        self.running = False
+        self.lock = threading.Lock()
+        self.log_callback = None
+        self.token_callback = None
+        self.app = None
+        self._shared_state = None  # Set by ServerProcessManager
+
+    def set_log_callback(self, callback):
+        self.log_callback = callback
+
+    def set_token_callback(self, callback):
+        self.token_callback = callback
+
+    def _log(self, msg: str):
+        if self.log_callback:
+            self.log_callback(f"[Bridge] {msg}")
+
+    def start(self) -> bool:
+        self.running = True
+        return True
+
+    def stop(self):
+        self.running = False
+
+    def _get_state(self, key, default=None):
+        if self._shared_state is None:
+            return default
+        try:
+            return self._shared_state.get(key, default)
+        except Exception:
+            return default
+
+    @property
+    def client_token(self) -> dict:
+        return self._get_state('bridge_token_map', {})
+
+    @property
+    def client_ports(self) -> dict:
+        return self._get_state('bridge_client_ports', {})
+
+    @property
+    def client_local_ids(self) -> dict:
+        return self._get_state('bridge_local_ids', {})
+
+    @property
+    def players(self) -> dict:
+        return self._get_state('players', {})
 
     def get_local_id(self, client_idx=None):
-        with self.lock:
-            if client_idx is not None:
-                return self.client_local_ids.get(client_idx)
-            for pid, data in self.players.items():
-                if data.get('is_local'):
-                    return pid
+        local_ids = self._get_state('bridge_local_ids', {})
+        if client_idx is not None:
+            return local_ids.get(client_idx)
+        for pid, data in self._get_state('players', {}).items():
+            if data.get('is_local'):
+                return pid
         return None
 
     def get_player_pos(self, player_id: int):
-        with self.lock:
-            data = self.players.get(player_id)
-            if data:
-                return {'x': data['x'], 'y': data['y'], 'is_local': data['is_local'], 'frozen': data['frozen']}
+        data = self._get_state('players', {}).get(player_id)
+        if data:
+            return {'x': data['x'], 'y': data['y'], 'is_local': data['is_local'], 'frozen': data['frozen']}
         return None
 
     def get_player_state(self, player_id: int):
-        with self.lock:
-            data = self.players.get(player_id)
-            return data.copy() if data else None
+        data = self._get_state('players', {}).get(player_id)
+        return data.copy() if data else None
 
     def get_all_players(self) -> Dict[int, dict]:
-        with self.lock:
-            return {pid: data.copy() for pid, data in self.players.items()}
+        result = self._get_state('players', {})
+        return {pid: data.copy() for pid, data in result.items()} if result else {}
 
     def get_server_info(self) -> dict:
-        with self.lock:
-            return {
-                'name': self.server_name,
-                'map': self.server_map,
-                'gametype': self.server_gametype,
-                'num_players': self.server_num_players,
-                'max_players': self.server_max_players
-            }
+        return self._get_state('server_info', {
+            'name': '', 'map': '', 'gametype': '', 'num_players': 0, 'max_players': 0
+        })
 
-# ========== CONTROL PROTOCOL ==========
-class ControlProtocol(asyncio.Protocol):
-    def __init__(self, server):
-        self.server = server
-        self.transport = None
-        self.buffer = ""
-        self.cid = None
 
-    def connection_made(self, transport):
-        self.transport = transport
-        transport.set_write_buffer_limits(high=262144)
-        client_port = transport.get_extra_info('peername')[1]
-        with self.server.lock:
-            self.cid = self.server.next_id
-            self.server.next_id += 1
-            self.server.clients[self.cid] = self
-            self.server.client_ports[self.cid] = client_port
-        self.server._log(f"Client #{self.cid} connected (port {client_port})")
-
-    def data_received(self, data):
-        self.buffer += data.decode('utf-8', errors='replace')
-        while '\n' in self.buffer:
-            line, self.buffer = self.buffer.split('\n', 1)
-            line = line.strip()
-            if line.startswith("TOKEN "):
-                token = line[6:].strip()
-                if _show_advanced_logs:
-                    self.server._log(f"Client #{self.cid} token: {token[:8]}...")
-                if self.server.token_callback:
-                    self.server.token_callback(self.cid, token)
-                    if self.server.app:
-                        self.server.app.sync_clients_by_pid()
-
-    def connection_lost(self, exc):
-        with self.server.lock:
-            self.server.clients.pop(self.cid, None)
-            self.server.client_ports.pop(self.cid, None)
-        self.server._log(f"Client #{self.cid} disconnected")
-
-    def send(self, data: str):
-        if self.transport and not self.transport.is_closing():
-            self.transport.write((data + "\n").encode('utf-8'))
-
-# ========== CONTROL SERVER ==========
+# ========== CONTROL SERVER (proxy to server process) ==========
 class ControlServer:
     def __init__(self, host='127.0.0.1', port=5555):
         self.host = host
         self.port = port
-        self._server = None
-        self.clients: Dict[int, ControlProtocol] = {}
-        self.client_ports: Dict[int, int] = {}
-        self.next_id = 1
         self.lock = threading.Lock()
         self.running = False
         self.log_callback = None
         self.token_callback = None
         self.app = None
+        self._cmd_queue = None  # Set by ServerProcessManager
+        self._shared_state = None  # Set by ServerProcessManager
 
     def set_log_callback(self, callback):
         self.log_callback = callback
@@ -335,126 +541,207 @@ class ControlServer:
         if self.log_callback:
             self.log_callback(f"[ControlServer] {msg}")
 
-    async def _start_async(self):
-        loop = asyncio.get_event_loop()
-        self._server = await loop.create_server(
-            lambda: ControlProtocol(self),
-            self.host, self.port
-        )
-        self.running = True
-        self._log(f"Server started on {self.host}:{self.port}")
-
     def start(self) -> bool:
-        if self.running:
-            return False
-        try:
-            loop = asyncio.get_event_loop()
-            loop.create_task(self._start_async())
-            return True
-        except Exception as e:
-            self._log(f"Failed to start: {e}")
-            return False
+        self.running = True
+        return True
 
     def stop(self):
         self.running = False
-        if self._server:
-            self._server.close()
-            self._server = None
-        with self.lock:
-            self.clients.clear()
-            self.client_ports.clear()
-        self._log("Server stopped")
 
     def random_char(self) -> str:
         import random, string
         return random.choice(string.ascii_letters + string.digits + "._-")
 
     def replace_placeholders(self, cmd: str, client_index: int) -> str:
-    
-        online = sorted(self.clients.keys())
-        rank = online.index(client_index) + 1 if client_index in online else client_index
-        cmd = cmd.replace("{i}", str(rank))
-    
-        while "{r}" in cmd:
-            cmd = cmd.replace("{r}", self.random_char(), 1)
-    
-        def replace_ri(match):
-            max_val = int(match.group(1))
-            return str(random.randint(0, max_val))
-        cmd = re.sub(r'{ri-(\d+)}', replace_ri, cmd)
-    
-        while "{n}" in cmd:
-            if _global_names:
-                cmd = cmd.replace("{n}", random.choice(_global_names), 1)
-            else:
-                cmd = cmd.replace("{n}", "lol", 1)
-    
-        while "{d}" in cmd:
-            if _global_dictionary:
-                cmd = cmd.replace("{d}", random.choice(_global_dictionary), 1)
-            else:
-                cmd = cmd.replace("{d}", "lol", 1)
-    
-        while "{c}" in cmd:
-            ch = chr(random.randint(0x4E00, 0x9FFF))
-            cmd = cmd.replace("{c}", ch, 1)
-    
+        # Placeholder replacement is done in the server process now
         return cmd
 
     def send_command(self, client_ids: List[int], command: str) -> Dict[int, bool]:
+        if self._cmd_queue is None:
+            return {cid: False for cid in client_ids}
+        
+        online = self._get_state('control_clients', [])
         results = {}
-        with self.lock:
-            targets = []
-            for cid in client_ids:
-                proto = self.clients.get(cid)
-                if not proto:
-                    results[cid] = False
-                    continue
-                final_cmd = self.replace_placeholders(command, cid)
-                targets.append((cid, proto, final_cmd))
-    
-        for cid, proto, cmd in targets:
-            try:
-                proto.send(cmd)
+        for cid in client_ids:
+            if cid in online:
                 results[cid] = True
-            except Exception:
+            else:
                 results[cid] = False
-    
-        return results
-
-        for cid, proto, cmd in targets:
-            try:
-                proto.send(cmd)
-                results[cid] = True
-            except Exception:
-                results[cid] = False
-
+        
+        try:
+            self._cmd_queue.put_nowait(('send', list(client_ids), command))
+        except Exception:
+            return {cid: False for cid in client_ids}
+        
         return results
 
     def get_online_clients(self) -> List[int]:
-        with self.lock:
-            return list(self.clients.keys())
+        return self._get_state('control_clients', [])
 
     def remove_client(self, client_id: int):
-        with self.lock:
-            proto = self.clients.pop(client_id, None)
-            self.client_ports.pop(client_id, None)
-        if proto and proto.transport:
-            proto.transport.close()
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(('remove', client_id))
+            except Exception:
+                pass
 
     def check_alive(self, client_id: int) -> bool:
-        with self.lock:
-            proto = self.clients.get(client_id)
-            if not proto:
-                return False
-            return proto.transport and not proto.transport.is_closing()
+        return client_id in self._get_state('control_clients', [])
+
+    def _get_state(self, key, default=None):
+        if self._shared_state is None:
+            return default
+        try:
+            return self._shared_state.get(key, default)
+        except Exception:
+            return default
+
+    @property
+    def clients(self) -> dict:
+        return {cid: True for cid in self._get_state('control_clients', [])}
+
+    @property
+    def client_ports(self) -> dict:
+        return self._get_state('control_client_ports', {})
+
+
+# ========== SERVER PROCESS MANAGER ==========
+class ServerProcessManager:
+    def __init__(self, control_port=5555, bridge_port=5556):
+        self.control_port = control_port
+        self.bridge_port = bridge_port
+        self._manager = None
+        self._shared_state = None
+        self._cmd_queue = None
+        self._event_queue = None
+        self._process = None
+        self._event_thread = None
+        self._running = False
+        self.log_callback = None
+        self.token_control_callback = None
+        self.token_bridge_callback = None
+
+    def set_callbacks(self, log_callback, token_control_callback, token_bridge_callback):
+        self.log_callback = log_callback
+        self.token_control_callback = token_control_callback
+        self.token_bridge_callback = token_bridge_callback
+
+    def start(self, control_server, bridge_receiver):
+        self._manager = multiprocessing.Manager()
+        self._shared_state = self._manager.dict()
+        self._cmd_queue = self._manager.Queue()
+        self._event_queue = self._manager.Queue()
+
+        # Initialize shared state
+        self._shared_state['control_clients'] = []
+        self._shared_state['control_client_ports'] = {}
+        self._shared_state['bridge_clients'] = []
+        self._shared_state['bridge_client_ports'] = {}
+        self._shared_state['bridge_local_ids'] = {}
+        self._shared_state['bridge_token_map'] = {}
+        self._shared_state['players'] = {}
+        self._shared_state['server_info'] = {"name": "", "map": "", "gametype": "", "num_players": 0, "max_players": 0}
+
+        self._process = multiprocessing.Process(
+            target=_server_process,
+            args=(self.control_port, self.bridge_port, self._cmd_queue, self._event_queue, self._shared_state),
+            daemon=True,
+        )
+        self._process.start()
+        self._running = True
+
+        # Wire up proxy objects
+        control_server._cmd_queue = self._cmd_queue
+        control_server._shared_state = self._shared_state
+        bridge_receiver._shared_state = self._shared_state
+
+        # Start event polling thread
+        self._event_thread = threading.Thread(target=self._poll_events, daemon=True)
+        self._event_thread.start()
+
+    def _poll_events(self):
+        while self._running:
+            try:
+                for _ in range(50):  # Batch process up to 50 events
+                    try:
+                        event = self._event_queue.get_nowait()
+                    except Exception:
+                        break
+                    
+                    event_type = event[0]
+                    if event_type == 'log' and self.log_callback:
+                        self.log_callback(event[1])
+                    elif event_type == 'token_control' and self.token_control_callback:
+                        cid, token = event[1], event[2]
+                        if _main_loop:
+                            _main_loop.call_soon_threadsafe(self.token_control_callback, cid, token)
+                    elif event_type == 'token_bridge' and self.token_bridge_callback:
+                        token, cidx = event[1], event[2]
+                        if _main_loop:
+                            _main_loop.call_soon_threadsafe(self.token_bridge_callback, token, cidx)
+            except Exception:
+                pass
+            time.sleep(0.01)  # 100 Hz polling
+
+    def stop(self):
+        self._running = False
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(('stop',))
+            except Exception:
+                pass
+        if self._process and self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=3)
+        if self._manager:
+            try:
+                self._manager.shutdown()
+            except Exception:
+                pass
+
+    def pause(self, control_server, bridge_receiver):
+        if not self._running:
+            return
+        self._running = False
+        if self._cmd_queue is not None:
+            try:
+                self._cmd_queue.put_nowait(('stop',))
+            except Exception:
+                pass
+        if self._process and self._process.is_alive():
+            self._process.terminate()
+            self._process.join(timeout=3)
+            if self._process.is_alive():
+                self._process.kill()
+                self._process.join(timeout=2)
+        self._process = None
+        # Give OS time to fully release ports (TIME_WAIT on Windows)
+        time.sleep(1.0)
+        if self._manager:
+            try:
+                self._manager.shutdown()
+            except Exception:
+                pass
+        self._manager = None
+        self._shared_state = None
+        self._cmd_queue = None
+        self._event_queue = None
+        control_server.running = False
+        bridge_receiver.running = False
+
+    def resume(self, control_server, bridge_receiver):
+        if self._running:
+            return
+        self.start(control_server, bridge_receiver)
+        control_server.running = True
+        bridge_receiver.running = True
 
 # ========== HDDNet CLIENT MANAGER ==========
 class HDDNetClientManager:
     def __init__(self, log_callback):
         self.log_callback = log_callback
         self.processes: Dict[int, subprocess.Popen] = {}
-        self.log_threads: Dict[int, asyncio.Task] = {}
+        self.log_threads: Dict[int, threading.Thread] = {}
         self.log_flags: Dict[int, bool] = {}
         self.lock = threading.Lock()
         self.base_dir = os.path.join(os.path.dirname(__file__), "DDNets-19.9-win64")
@@ -519,7 +806,8 @@ class HDDNetClientManager:
                     self.log_flags.pop(client_id, None)
                 self._log(f"Client #{client_id} has terminated")
 
-            t = asyncio.create_task(asyncio.to_thread(reader))
+            t = threading.Thread(target=reader, daemon=True)
+            t.start()
             with self.lock:
                 self.log_threads[client_id] = t
             self._log(f"✅ Client #{client_id} started (PID {proc.pid})")
@@ -623,12 +911,13 @@ class HDDNetClientManager:
         result = {'pid': pid, 'control_port': None, 'bridge_port': None}
         try:
             proc = psutil.Process(pid)
-            for conn in proc.net_connections():
-                if conn.status == 'ESTABLISHED':
-                    if conn.raddr.port == 5555:
-                        result['control_port'] = conn.laddr.port
-                    elif conn.raddr.port == 5556:
-                        result['bridge_port'] = conn.laddr.port
+            for conn in proc.net_connections(kind='tcp'):          # только TCP
+                if conn.status != 'ESTABLISHED' or not conn.raddr:
+                    continue
+                if conn.raddr.port == 5555 and result['control_port'] is None:   # берём первое, не перезаписываем
+                    result['control_port'] = conn.laddr.port
+                elif conn.raddr.port == 5556 and result['bridge_port'] is None:
+                    result['bridge_port'] = conn.laddr.port
         except psutil.NoSuchProcess:
             pass
         except Exception:
@@ -739,16 +1028,26 @@ class DMClientsApp:
                 self._pending_timers[cid] = timer
 
             elif ext == 'rule':
-                thread = asyncio.create_task(asyncio.to_thread(self._run_rule, cid))
-                self._rule_threads[cid] = thread
+                try:
+                    thread = asyncio.create_task(asyncio.to_thread(self._run_rule, cid))
+                    self._rule_threads[cid] = thread
+                except RuntimeError:
+                    self._active_clients.discard(cid)
 
             self.app.add_log(f"▶️ Macro started for client #{cid}")
 
         def _stop_macros(self):
             self._running = False
             clients = list(self._active_clients)
+            # Cancel all timers and rule tasks before clearing
             for cid in clients:
-                self._cancel_client_macro(cid)
+                timer = self._pending_timers.pop(cid, None)
+                if timer and isinstance(timer, asyncio.Task) and not timer.done():
+                    timer.cancel()
+                rule_task = self._rule_threads.pop(cid, None)
+                if rule_task and isinstance(rule_task, asyncio.Task) and not rule_task.done():
+                    rule_task.cancel()
+                self.app.control_server.send_command([cid], "c_macro_play 0")
             self._active_clients.clear()
             self._pending_timers.clear()
             self._rule_threads.clear()
@@ -757,16 +1056,23 @@ class DMClientsApp:
 
         def _cancel_client_macro(self, cid: int):
             timer = self._pending_timers.pop(cid, None)
-            if timer and timer.is_alive():
+            if timer and isinstance(timer, asyncio.Task) and not timer.done():
                 timer.cancel()
-            self._rule_threads.pop(cid, None)
+            rule_task = self._rule_threads.pop(cid, None)
+            if rule_task and isinstance(rule_task, asyncio.Task) and not rule_task.done():
+                rule_task.cancel()
             self.app.control_server.send_command([cid], "c_macro_play 0")
             if self.dont_block_if_macros_cb and self.dont_block_if_macros_cb.value:
                 if self.app.attack_enable_switch.value:
                     self.app.control_server.send_command([cid], "c_attack 1")
 
         def _on_macro_done(self, cid: int):
-            self.app._loop.call_soon_threadsafe(lambda: self._handle_client_macro_finished(cid))
+            # _on_macro_done is called from _async_timer callback which already
+            # runs on the event loop, so we can call directly
+            try:
+                self._handle_client_macro_finished(cid)
+            except Exception:
+                pass
 
         def _handle_client_macro_finished(self, cid: int):
             if cid not in self._active_clients:
@@ -795,6 +1101,7 @@ class DMClientsApp:
             if not self._running:
                 return
             if max_duration > 0:
+                # _async_timer is now thread-safe — works from worker threads
                 timer = _async_timer((max_duration + 150) / 1000.0, lambda: self._on_macro_done(cid))
                 self._pending_timers[cid] = timer
             else:
@@ -953,6 +1260,7 @@ class DMClientsApp:
                 'send_to': lambda target_cid, cmd: self.app.control_server.send_command([target_cid], cmd),
                 'get_clients': lambda: self.app.control_server.get_online_clients(),
                 'get_selected': lambda: self.app.get_selected_clients(),
+                'get_selected_control': lambda: self.app.get_selected_control_cids(),
                 'get_log': lambda target_cid: self.app.client_manager.client_log.get(target_cid, ''),
                 'log': log,
                 'sleep': sleep_ms,
@@ -1071,8 +1379,7 @@ class DMClientsApp:
                 self._base_delay_ms = int(delay_str) if delay_str else 0
             except ValueError:
                 self._base_delay_ms = 0
-            selected = self.app.get_selected_clients()
-            online = [cid for cid in selected if cid in self.app.control_server.clients]
+            online = self.app.get_selected_control_cids()
             if not online:
                 self.app.add_log("⚠️ No online clients selected")
                 return
@@ -1114,10 +1421,12 @@ class DMClientsApp:
                     await asyncio.sleep(0.2)
 
                     try:
-                        online_selected = [cid for cid in self.app.get_selected_clients() 
-                                           if cid in self.app.control_server.clients]
+                        selected_ddnet = self.app.get_selected_clients()
 
-                        for cid in online_selected:
+                        for ddnet_id in selected_ddnet:
+                            cid = self.app.client_to_control.get(ddnet_id)
+                            if cid is None or cid not in self.app.control_server.clients:
+                                continue
                             bridge_cidx = self.app.control_to_bridge.get(cid)
                             if bridge_cidx is None:
                                 continue
@@ -1423,7 +1732,12 @@ class DMClientsApp:
             self.execute_btn.update()
             self.editor_status.value = "Executing..."
             self.editor_status.update()
-            asyncio.create_task(asyncio.to_thread(self._run_code, code))
+            try:
+                asyncio.create_task(asyncio.to_thread(self._run_code, code))
+            except RuntimeError:
+                self._running = False
+                self.editor_status.value = "Error: no event loop"
+                self.editor_status.update()
 
         def _on_code_change(self, e):
             if self.code_editor and self.code_editor.value:
@@ -1488,6 +1802,7 @@ class DMClientsApp:
                     'send_to': lambda cid, cmd: app.control_server.send_command([cid], cmd),
                     'get_clients': lambda: app.control_server.get_online_clients(),
                     'get_selected': lambda: app.get_selected_clients(),
+                    'get_selected_control': lambda: app.get_selected_control_cids(),
                     'log': lambda msg: app.add_log(f"[Code] {msg}"),
                     'sleep': lambda ms: time.sleep(ms / 1000),
                     'server_name': lambda: app.bridge_receiver.get_server_info().get('name', ''),
@@ -1583,7 +1898,9 @@ class DMClientsApp:
         except:
             pass
 
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
+        global _main_loop
+        _main_loop = self._loop
         self._last_scroll_time = 0
         self._log_update_timer = 0
         self._auto_scroll = True
@@ -1596,15 +1913,18 @@ class DMClientsApp:
 
         self.bridge_receiver = BridgeReceiver()
         self.bridge_receiver.set_log_callback(self.add_log)
-    
+
+        # Server Process Manager — runs Bridge + Control in a separate process
+        self._server_mgr = ServerProcessManager()
+
         self.control_server.start()
         self.bridge_receiver.start()
-    
+
         self.bridge_receiver.app = self
         self.control_server.app = self
-        self.sync_clients_by_pid()
 
         self.control_to_bridge: Dict[int, int] = {}
+        self.client_to_control: Dict[int, int] = {}
         self._pending_control_tokens: Dict[str, int] = {}
         self._pending_bridge_tokens: Dict[str, int] = {}
 
@@ -1615,6 +1935,7 @@ class DMClientsApp:
                 if _show_advanced_logs:
                     self.add_log(f"✅ Synced: Control #{cid} ↔ Bridge #{bridge_cidx}")
                 self.sync_clients_by_pid()
+                _async_timer(2.0, self.sync_clients_by_pid)
             else:
                 self._pending_control_tokens[token] = cid
 
@@ -1625,11 +1946,18 @@ class DMClientsApp:
                 if _show_advanced_logs:
                     self.add_log(f"✅ Synced: Control #{cid} ↔ Bridge #{bridge_cidx}")
                 self.sync_clients_by_pid()
+                _async_timer(2.0, self.sync_clients_by_pid)
             else:
                 self._pending_bridge_tokens[token] = bridge_cidx
 
         self.control_server.set_token_callback(on_control_token)
         self.bridge_receiver.set_token_callback(on_bridge_token)
+
+        # Start server process (after token callbacks are set)
+        self._server_mgr.set_callbacks(self.add_log, on_control_token, on_bridge_token)
+        self._server_mgr.start(self.control_server, self.bridge_receiver)
+
+        self.sync_clients_by_pid()
 
         self._detect_config()
 
@@ -1693,28 +2021,35 @@ class DMClientsApp:
                 c.nice(psutil.REALTIME_PRIORITY_CLASS)
 
     def add_log(self, text: str):
-        def _add():
-            lines = self._log_text.value.split('\n') if self._log_text.value else []
-            lines.append(text)
-            if len(lines) > self.MAX_LOG_LINES:
-                lines = lines[-self.MAX_LOG_LINES:]
-            self._log_text.value = '\n'.join(lines)
+        async def _do():
+            try:
+                lines = self._log_text.value.split('\n') if self._log_text.value else []
+                lines.append(text)
+                if len(lines) > self.MAX_LOG_LINES:
+                    lines = lines[-self.MAX_LOG_LINES:]
 
-            if not self.console_container.visible:
-                return
+                self._log_text.value = '\n'.join(lines)
 
-            self.page.update()
+                if not self.console_container.visible:
+                    return
 
-            if self._auto_scroll:
-                async def scroll():
-                    await asyncio.sleep(0.05)
+                self.page.update()
+
+                if self._auto_scroll:
+                    await asyncio.sleep(0.02)
                     try:
                         await self.log_box.scroll_to(offset=-1, duration=0)
                     except Exception:
                         pass
-                asyncio.ensure_future(scroll(), loop=self._loop)
+            except Exception:
+                pass  # Prevent log errors from crashing
 
-        self._loop.call_soon_threadsafe(_add)
+        if self._loop is None or self._loop.is_closed():
+            return
+        try:
+            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(_do()))
+        except RuntimeError:
+            pass
 
     def _on_scroll(self, e: ft.OnScrollEvent):
         if e.pixels >= e.max_scroll_extent - 30:
@@ -1753,23 +2088,16 @@ class DMClientsApp:
     def get_selected_clients(self) -> List[int]:
         return [i + 1 for i, cb in enumerate(self.send_checkboxes) if cb.value]
 
-    def send_command_to_clients(self, command: str):
-        selected = self.get_selected_clients()
-    
-        if not selected:
-            self.add_log("⚠️ No clients selected")
-            return
-    
-        real_cids = []
-        for client_id in selected:
-            cid = None
-            for c, bridge_cidx in self.control_to_bridge.items():
-                if bridge_cidx == client_id:
-                    cid = c
-                    break
-        
+    def get_selected_control_cids(self) -> List[int]:
+        result = []
+        for ddnet_id in self.get_selected_clients():
+            cid = self.client_to_control.get(ddnet_id)
             if cid is not None and cid in self.control_server.clients:
-                real_cids.append(cid)
+                result.append(cid)
+        return result
+
+    def send_command_to_clients(self, command: str):
+        real_cids = self.get_selected_control_cids()
     
         if not real_cids:
             self.add_log("⚠️ No online clients selected")
@@ -1793,6 +2121,16 @@ class DMClientsApp:
         self.send_command_to_clients(command)
 
     def sync_clients_by_pid(self):
+        if not hasattr(self, 'control_to_bridge'):
+            return
+        online_cids = set(self.control_server.clients.keys())
+        for cid in list(self.control_to_bridge):
+            if cid not in online_cids:
+                del self.control_to_bridge[cid]
+        for ddnet_id in list(self.client_to_control):
+            if self.client_to_control[ddnet_id] not in online_cids:
+                del self.client_to_control[ddnet_id]
+
         bridge_by_port = {}
         with self.bridge_receiver.lock:
             for cidx, port in self.bridge_receiver.client_ports.items():
@@ -1805,13 +2143,8 @@ class DMClientsApp:
 
         clients_info = self.client_manager.get_all_clients_connection_info()
 
-        already_logged = getattr(self, '_synced_client_ids', set())
-
         synced = 0
         for client_id, info in clients_info.items():
-            if client_id in already_logged:
-                continue
-
             control_port = info.get('control_port')
             bridge_port  = info.get('bridge_port')
 
@@ -1821,45 +2154,22 @@ class DMClientsApp:
             if cid is None or bridge_cidx is None:
                 continue
 
-            self.control_to_bridge[cid] = bridge_cidx
-            already_logged.add(client_id)
-            self._synced_client_ids = already_logged
-            synced += 1
-            if _show_advanced_logs:
-                self.add_log(f"🔗 Synced: Client #{client_id} → Control #{cid} ↔ Bridge #{bridge_cidx}")
+            is_new = client_id not in self.client_to_control
+            self.client_to_control[client_id] = cid
+
+            if cid not in self.control_to_bridge:
+                self.control_to_bridge[cid] = bridge_cidx
+
+            if is_new:
+                synced += 1
+                if _show_advanced_logs:
+                    self.add_log(f"🔗 Synced: Client #{client_id} → Control #{cid} ↔ Bridge #{bridge_cidx}")
 
         return synced
 
     def _start_monitoring(self):
-        def monitor_loop():
-            last_update = 0
-            while True:
-                time.sleep(2)
-                now = time.time()
-                need_update = False
-                for i in range(1, self.NUM_CLIENTS + 1):
-                    running = self.client_manager.is_running(i)
-                    try:
-                        btn = self.connect_buttons[i - 1]
-                    except IndexError:
-                        continue
-                    current_text = btn.content.value if btn.content else "Connect"
-                    if running and current_text != "Disconnect":
-                        btn.content = ft.Text("Disconnect")
-                        btn.icon = ft.Icons.STOP
-                        need_update = True
-                    elif not running and current_text != "Connect":
-                        btn.content = ft.Text("Connect")
-                        btn.icon = ft.Icons.PLAY_ARROW
-                        need_update = True
-                for cid in self.control_server.get_online_clients():
-                    if not self.control_server.check_alive(cid):
-                        self.add_log(f"Client #{cid} disconnected from control server")
-                        need_update = True
-                if need_update and now - last_update > 0.5:
-                    last_update = now
-                    self._loop.call_soon_threadsafe(self.page.update)
-        asyncio.create_task(asyncio.to_thread(monitor_loop))
+        pass  # The old threaded monitor_loop has been removed to avoid race conditions.
+                 # The async monitor_loop (below) handles all monitoring.
 
     async def monitor_loop(self):
         cpu_count = psutil.cpu_count(logical=True)
@@ -1870,11 +2180,13 @@ class DMClientsApp:
             try:
                 current_load = await asyncio.to_thread(psutil.cpu_percent, interval=0.1)
                 interval = 5 if current_load > 70 else 3
-            except:
+            except Exception:
                 interval = 3
             await asyncio.sleep(interval)
 
             if not self.clients_container.visible:
+                # Still check button states even when tab is hidden
+                self._update_connect_buttons()
                 continue
 
             tasks = []
@@ -1887,8 +2199,32 @@ class DMClientsApp:
                     self.cpu_texts[i - 1].value = "0%"
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Update connect/disconnect buttons
+            self._update_connect_buttons()
+
             self.update_clients_stats()
             self.page.update()
+
+    def _update_connect_buttons(self):
+        need_update = False
+        for i in range(1, self.NUM_CLIENTS + 1):
+            running = self.client_manager.is_running(i)
+            try:
+                btn = self.connect_buttons[i - 1]
+            except IndexError:
+                continue
+            current_text = btn.content.value if btn.content else "Connect"
+            if running and current_text != "Disconnect":
+                btn.content = ft.Text("Disconnect")
+                btn.icon = ft.Icons.STOP
+                need_update = True
+            elif not running and current_text != "Connect":
+                btn.content = ft.Text("Connect")
+                btn.icon = ft.Icons.PLAY_ARROW
+                need_update = True
+        if need_update:
+            self.sync_clients_by_pid()
 
     async def _get_process_stats(self, idx, pid, warned_uss, prev_cpu, prev_time, cpu_count):
         try:
@@ -2102,19 +2438,6 @@ class DMClientsApp:
             cb.update()
         self.header_cmd_cb.value = new_val
         self.header_cmd_cb.update()
-
-    def _sync_header_logs(self):
-        if not self.header_logs_cb or not self.logs_checkboxes:
-            return
-        values = [cb.value for cb in self.logs_checkboxes]
-        if all(values):
-            self.header_logs_cb.value = True
-        else:
-            self.header_logs_cb.value = False
-        try:
-            self.header_logs_cb.update()
-        except Exception:
-            pass
 
     def _sync_header_cmd(self):
         if not self.header_cmd_cb or not self.cmd_checkboxes:
@@ -2910,8 +3233,10 @@ class DMClientsApp:
         self.spare_proxies_switch = ft.Switch(value=False, label="Use spare proxies")
         self.spare_count_field = ft.TextField(label="Spare count", value="5", width=80,
                                               bgcolor="#1e1e24", border_color="#33334d")
-        self.target_server_field = ft.TextField(label="Target server", value="", width=200,
+        self.target_server_field = ft.TextField(label="Target server", value="45.141.57.22:8390", width=200,
                                                 bgcolor="#1e1e24", border_color="#33334d", tooltip="The server on which to check the proxy")
+        self.timeout_field = ft.TextField(label="Timeout (ms)", value="5000", width=120,
+                                          bgcolor="#1e1e24", border_color="#33334d", tooltip="Ping/IP check timeout in ms")
 
         try:
             with open("optimal_proxies_new.py", "r", encoding="utf-8") as f:
@@ -2935,7 +3260,7 @@ class DMClientsApp:
                     ft.Text("Set client count:", size=14),
                     self.num_clients_field, self.clients_per_proxy_field, self.apply_clients_btn,
                 ], spacing=10),
-                ft.Row([self.spare_proxies_switch, self.spare_count_field, self.target_server_field], spacing=10),
+                ft.Row([self.spare_proxies_switch, self.spare_count_field, self.target_server_field, self.timeout_field], spacing=10),
             ], spacing=10),
             padding=10, bgcolor="#1a1a24", border_radius=10
         )
@@ -2963,6 +3288,7 @@ class DMClientsApp:
                 ft.DataColumn(ft.Text("Port", weight="bold")),
                 ft.DataColumn(ft.Text("Proxy", weight="bold")),
                 ft.DataColumn(ft.Text("Action", weight="bold")),
+                ft.DataColumn(ft.Text("Ping", weight="bold")),
             ],
             rows=[],
             heading_row_color="#1e1e24",
@@ -2978,7 +3304,11 @@ class DMClientsApp:
         refresh_btn = ft.FilledButton("Refresh", icon=ft.Icons.REFRESH,
                                       on_click=self._refresh_proxies_table,
                                       style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
-        top_bar = ft.Row([refresh_btn, self.spare_label], spacing=20, alignment=ft.MainAxisAlignment.START)
+        ping_btn = ft.FilledButton("Ping proxies", icon=ft.Icons.SPEED,
+                                    on_click=self._ping_proxies,
+                                    style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
+        top_bar = ft.Row([refresh_btn, ping_btn, self.spare_label], spacing=20, alignment=ft.MainAxisAlignment.START)
+        self._refresh_proxies_table()
         return ft.Container(
             content=ft.Column([
                 top_bar,
@@ -3000,35 +3330,38 @@ class DMClientsApp:
         self.clients_container.update()
 
     def _refresh_proxies_table(self, e=None):
-        if not self.settings_container.visible:
-            return
         self._load_spare_proxies()
+        rows = []
+        json_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for item in data:
+                    port = item["port"]
+                    key = item["key"]
+                    key_preview = key.split("#")[0][:50]
+                    replace_btn = ft.FilledButton("Replace", icon=ft.Icons.REFRESH,
+                                                  on_click=lambda e, p=port: self._replace_proxy(p), width=200,
+                                                  style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
+                    rows.append(ft.DataRow(cells=[
+                        ft.DataCell(ft.Text(str(port))),
+                        ft.DataCell(ft.Text(key_preview)),
+                        ft.DataCell(replace_btn),
+                        ft.DataCell(ft.Text("—")),
+                    ]))
+            except Exception as e:
+                if hasattr(self, '_log_text'):
+                    self.add_log(f"❌ Error updating proxy table: {e}")
+        self.proxy_table.rows = rows
         if hasattr(self, 'spare_label'):
             self.spare_label.value = f"Spare proxies: {len(self.spare_proxies)}"
-            self.spare_label.update()
-        json_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
-        if not os.path.exists(json_path):
-            return
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            rows = []
-            for item in data:
-                port = item["port"]
-                key = item["key"]
-                key_preview = key.split("#")[0][:50]
-                replace_btn = ft.FilledButton("Replace", icon=ft.Icons.REFRESH,
-                                              on_click=lambda e, p=port: self._replace_proxy(p),
-                                              style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
-                rows.append(ft.DataRow(cells=[
-                    ft.DataCell(ft.Text(str(port))),
-                    ft.DataCell(ft.Text(key_preview)),
-                    ft.DataCell(replace_btn),
-                ]))
-            self.proxy_table.rows = rows
             self.proxy_table.update()
-        except Exception as e:
-            self.add_log(f"❌ Error updating proxy table: {e}")
+            if hasattr(self, 'spare_label'):
+                self.spare_label.update()
+        except Exception:
+            pass
 
     def on_send_click(self):
         if self.page.input_field.value:
@@ -3146,7 +3479,10 @@ class DMClientsApp:
     async def on_cron_toggle(self, e):
         if self.cron_switch.value:
             if not hasattr(self, '_cron_task') or self._cron_task is None or self._cron_task.done():
-                self._cron_task = asyncio.create_task(self._cron_loop())
+                try:
+                    self._cron_task = asyncio.create_task(self._cron_loop())
+                except RuntimeError:
+                    pass
                 self.add_log(f"⏱️ Spam command started: '{self.cron_command.value}' every {self.cron_delay.value} ms")
         else:
             if hasattr(self, '_cron_task') and self._cron_task and not self._cron_task.done():
@@ -3180,19 +3516,20 @@ class DMClientsApp:
     async def on_random_aim_toggle(self, e):
         if self.random_aim_checkbox.value:
             if self.random_aim_task is None or self.random_aim_task.done():
-                self.random_aim_task = asyncio.create_task(self.random_aim_loop())
+                try:
+                    self.random_aim_task = asyncio.create_task(self.random_aim_loop())
+                except RuntimeError:
+                    pass
         else:
             if self.random_aim_task and not self.random_aim_task.done():
                 self.random_aim_task.cancel()
                 self.random_aim_task = None
-                selected = self.get_selected_clients()
-                for cid in selected:
+                for cid in self.get_selected_control_cids():
                     self.control_server.send_command([cid], "c_random_aim 0")
 
     def on_random_for_all_change(self, e):
         if not self.random_for_all_checkbox.value:
-            selected = self.get_selected_clients()
-            for cid in selected:
+            for cid in self.get_selected_control_cids():
                 self.control_server.send_command([cid], "c_random_aim 0")
 
     async def random_aim_loop(self):
@@ -3203,8 +3540,7 @@ class DMClientsApp:
                 interval_ms = 100
 
             if self.random_for_all_checkbox.value:
-                selected = self.get_selected_clients()
-                for cid in selected:
+                for cid in self.get_selected_control_cids():
                     self.control_server.send_command([cid], f"c_random_aim 1 {interval_ms}")
             else:
                 x = random.randint(-1000, 1000)
@@ -3236,8 +3572,10 @@ class DMClientsApp:
         bot_ids = set()
         main_id = self.main_id_field.value.strip()
         main_id_int = int(main_id) if main_id and main_id != "-1" else None
-        for cid in selected:
-            lid = self.bridge_receiver.get_local_id(cid)
+        for ddnet_id in selected:
+            control_cid = self.client_to_control.get(ddnet_id)
+            bridge_cidx = self.control_to_bridge.get(control_cid) if control_cid else None
+            lid = self.bridge_receiver.get_local_id(bridge_cidx) if bridge_cidx is not None else None
             if lid is not None and lid != main_id_int:
                 bot_ids.add(lid)
         result = ','.join(str(pid) for pid in bot_ids)
@@ -3311,7 +3649,7 @@ class DMClientsApp:
         self.send_action_command(f"c_atk_pathfinder_sps {1 if self.pathfinder_sps_cb.value else 0}")
 
     def _send_client_delay(self):
-        selected = self.get_selected_clients()
+        selected = self.get_selected_control_cids()
         if not selected:
             return
         enabled = self.delay_checkbox.value
@@ -3370,7 +3708,6 @@ class DMClientsApp:
         self._schedule_attack_config_update()
 
     def _compute_zone_target_ids(self):
-        """Parse Target Coords field (x1,y1-x2,y2; x3,y3-x4,y4) and return set of player IDs in those zones."""
         coords_text = self.target_coords_field.value.strip()
         if not coords_text:
             return set()
@@ -3440,19 +3777,22 @@ class DMClientsApp:
                 self.send_action_command(f"c_pathfinder_go 1 {x} {y}")
             except:
                 self.send_action_command("c_pathfinder_go 1")
-            asyncio.create_task(self.monitor_pathfinder_go_status())
+            try:
+                asyncio.create_task(self.monitor_pathfinder_go_status())
+            except RuntimeError:
+                pass
         else:
             self.send_action_command("c_pathfinder_go 0")
 
     async def monitor_pathfinder_go_status(self):
         while self.pathfinder_go_switch.value:
             await asyncio.sleep(0.5)
-            for cid in self.get_selected_clients():
-                if "Reached destination" in self.client_manager.client_log.get(cid, ""):
+            for ddnet_id in self.get_selected_clients():
+                if "Reached destination" in self.client_manager.client_log.get(ddnet_id, ""):
                     self.pathfinder_go_switch.value = False
                     self.pathfinder_go_switch.update()
                     self.send_action_command("c_pathfinder_go 0")
-                    self.add_log(f"✅ Client #{cid} reached destination")
+                    self.add_log(f"✅ Client #{ddnet_id} reached destination")
                     break
 
     def on_fix_players_toggle(self, e):
@@ -3527,7 +3867,10 @@ class DMClientsApp:
                 self._loop.call_soon_threadsafe(self.update_clients_stats)
                 self._loop.call_soon_threadsafe(self.page.update)
 
-            asyncio.create_task(asyncio.to_thread(launch_with_delay))
+            try:
+                asyncio.create_task(asyncio.to_thread(launch_with_delay))
+            except RuntimeError:
+                self.add_log("❌ Failed to start clients: no event loop")
 
         self.all_clients_btn.update()
         self.update_clients_stats()
@@ -3673,7 +4016,10 @@ class DMClientsApp:
         if idx == 0:
             self.console_container.visible = True
             self.page.run_task(self.page.input_field.focus)
-            asyncio.create_task(self.log_box.scroll_to(offset=-1, duration=0))
+            try:
+                asyncio.create_task(self.log_box.scroll_to(offset=-1, duration=0))
+            except RuntimeError:
+                pass
         elif idx == 1:
             self.clients_container.visible = True
         elif idx == 2:
@@ -3696,21 +4042,20 @@ class DMClientsApp:
         if not os.path.exists(script_path):
             self.add_log(f"❌ File {script_path} not found")
             return
-        was_running = self.control_server.running
+        was_running = self._server_mgr._running
         if was_running:
-            self.control_server.stop()
-            self.add_log("⏸️ TCP Control Server temporarily stopped for proxy selection")
-        was_bridge_running = self.bridge_receiver.running
-        if was_bridge_running:
-            self.bridge_receiver.stop()
-            self.add_log("⏸️ Bridge Receiver temporarily stopped for proxy selection")
+            self._server_mgr.pause(self.control_server, self.bridge_receiver)
+            self.add_log("⏸️ Servers paused for proxy selection (ports freed)")
         cmd = [sys.executable, "-u", script_path]
         target = self.target_server_field.value.strip()
+        count = self.spare_count_field.value.strip() or "5"
+        timeout = self.timeout_field.value.strip() or "5000"
         if target:
             cmd.append(f"--target-server={target}")
         if self.spare_proxies_switch.value:
-            count = self.spare_count_field.value.strip() or "5"
             cmd.append(f"--spare-proxies={count}")
+        if timeout:
+            cmd.append(f"--timeout={timeout}")
         top_n = (self.NUM_CLIENTS + self.clients_per_proxy - 1) // self.clients_per_proxy
         cmd.append(f"--top-n={top_n}")
         if self.spare_proxies_switch.value:
@@ -3720,6 +4065,7 @@ class DMClientsApp:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
+        env["COLUMNS"] = "200"
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1, encoding='utf-8', env=env,
                                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0, 
@@ -3740,99 +4086,135 @@ class DMClientsApp:
                     self.optimal_proxies_proc = None
                 self._refresh_proxies_table()
                 self._load_spare_proxies()
-                if was_running:
-                    self.control_server.start()
-                    self.add_log("▶️ TCP Control Server restarted")
-                if was_bridge_running:
-                    self.bridge_receiver.start()
-                    self.add_log("▶️ Bridge Receiver restarted")
-        asyncio.create_task(asyncio.to_thread(read_output))
 
-    def fast_proxies(self, e):
-        import random
-        import socks as pysocks
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from python_v2ray.config_parser import parse_uri
-        import requests
-        import threading
+                def resume_servers():
+                    if was_running:
+                        self._server_mgr.resume(self.control_server, self.bridge_receiver)
+                        self.add_log("▶️ Servers resumed")
+                
+                self._loop.call_soon_threadsafe(resume_servers)
+        try:
+            asyncio.create_task(asyncio.to_thread(read_output))
+        except RuntimeError:
+            self.add_log("❌ Failed to start output reader")
 
-        temp_dir = os.path.join(os.path.dirname(__file__), "temp")
-        os.makedirs(temp_dir, exist_ok=True)
+    # ========== PROXY HELPERS ==========
+    def _parse_key_to_config(self, key: str) -> dict | None:
+        try:
+            from python_v2ray.config_parser import parse_uri
 
-        def key_preview(key: str) -> str:
-            return key.split("#")[0][:60]
+            k = key
+            if k.startswith("socks5://"):
+                k = "socks://" + k[len("socks5://"):]
 
-        def parse_key_to_config(key: str) -> dict | None:
-            try:
-                parsed = parse_uri(key)
-                server = getattr(parsed, 'address', None) or getattr(parsed, 'server', None) or getattr(parsed, 'host', None)
-                if not server:
-                    return None
-                if parsed.protocol in ('vless', 'vmess'):
-                    outbound = {
-                        "protocol": parsed.protocol,
-                        "settings": {"vnext": [{"address": server, "port": parsed.port,
-                                                "users": [{"id": getattr(parsed, 'id', getattr(parsed, 'uuid', '')),
-                                                           "encryption": getattr(parsed, 'encryption', 'none'),
-                                                           "flow": getattr(parsed, 'flow', '')}]}]},
-                        "streamSettings": {"network": getattr(parsed, 'network', 'tcp'),
-                                           "security": getattr(parsed, 'security', 'none')}
-                    }
-                    if getattr(parsed, 'security', '') == 'reality':
-                        outbound['streamSettings']['realitySettings'] = {
-                            "serverName": getattr(parsed, 'sni', ''),
-                            "fingerprint": 'chrome',
-                            "publicKey": getattr(parsed, 'pbk', ''),
-                            "shortId": getattr(parsed, 'sid', ''),
-                            "spiderX": "/"
-                        }
-                    return outbound
-                elif parsed.protocol in ('shadowsocks', 'ss'):
-                    return {
-                        "protocol": "shadowsocks",
-                        "settings": {"servers": [{"address": server, "port": parsed.port,
-                                                  "method": getattr(parsed, 'method', 'chacha20-ietf-poly1305'),
-                                                  "password": getattr(parsed, 'password', '')}]}
-                    }
-                elif parsed.protocol == 'trojan':
-                    return {
-                        "protocol": "trojan",
-                        "settings": {"servers": [{"address": server, "port": parsed.port,
-                                                  "password": getattr(parsed, 'password', getattr(parsed, 'uuid', ''))}]},
-                        "streamSettings": {"security": "tls",
-                                           "tlsSettings": {"serverName": getattr(parsed, 'sni', server),
-                                                           "allowInsecure": True}}
-                    }
-            except:
+            parsed = parse_uri(k)
+            server = getattr(parsed, 'address', None) or getattr(parsed, 'server', None) or getattr(parsed, 'host', None)
+            if not server:
                 return None
+
+            if parsed.protocol in ('vless', 'vmess'):
+                outbound = {
+                    "protocol": parsed.protocol,
+                    "settings": {"vnext": [{"address": server, "port": parsed.port,
+                                            "users": [{"id": getattr(parsed, 'id', getattr(parsed, 'uuid', '')),
+                                                       "encryption": getattr(parsed, 'encryption', 'none'),
+                                                       "flow": getattr(parsed, 'flow', '')}]}]},
+                    "streamSettings": {"network": getattr(parsed, 'network', 'tcp'),
+                                       "security": getattr(parsed, 'security', 'none')}
+                }
+                sec = getattr(parsed, 'security', '')
+                if sec == 'reality':
+                    outbound['streamSettings']['realitySettings'] = {
+                        "serverName": getattr(parsed, 'sni', ''),
+                        "fingerprint": 'chrome',
+                        "publicKey": getattr(parsed, 'pbk', ''),
+                        "shortId": getattr(parsed, 'sid', ''),
+                        "spiderX": "/"
+                    }
+                elif sec == 'tls':
+                    outbound['streamSettings']['tlsSettings'] = {
+                        "serverName": getattr(parsed, 'sni', server),
+                        "allowInsecure": True
+                    }
+                return outbound
+
+            elif parsed.protocol in ('shadowsocks', 'ss'):
+                return {
+                    "protocol": "shadowsocks",
+                    "settings": {"servers": [{"address": server, "port": parsed.port,
+                                              "method": getattr(parsed, 'method', 'chacha20-ietf-poly1305'),
+                                              "password": getattr(parsed, 'password', '')}]}
+                }
+
+            elif parsed.protocol == 'trojan':
+                return {
+                    "protocol": "trojan",
+                    "settings": {"servers": [{"address": server, "port": parsed.port,
+                                              "password": getattr(parsed, 'password', getattr(parsed, 'uuid', ''))}]},
+                    "streamSettings": {"security": "tls",
+                                       "tlsSettings": {"serverName": getattr(parsed, 'sni', server),
+                                                       "allowInsecure": True}}
+                }
+
+            elif parsed.protocol in ('hysteria', 'hysteria2'):
+                return {
+                    "protocol": parsed.protocol,
+                    "settings": {"servers": [{"address": server, "port": parsed.port,
+                                              "password": getattr(parsed, 'password', getattr(parsed, 'auth', ''))}]},
+                    "streamSettings": {"network": "tcp", "security": "tls",
+                                       "tlsSettings": {"serverName": getattr(parsed, 'sni', server),
+                                                       "allowInsecure": True}}
+                }
+
+            elif parsed.protocol == 'socks':
+                user = getattr(parsed, 'id', '') or ''
+                pwd = getattr(parsed, 'password', '') or ''
+                srv = {"address": server, "port": parsed.port}
+                if user:
+                    srv["users"] = [{"user": user, "pass": pwd}]
+                return {
+                    "protocol": "socks",
+                    "settings": {"servers": [srv]}
+                }
+        except Exception:
+            return None
+        return None
+
+    def _test_proxy_xray(self, key: str, port: int, test_dns: bool = False) -> float | tuple | None:
+        import requests
+        import socks as pysocks
+
+        outbound = self._parse_key_to_config(key)
+        if not outbound:
             return None
 
-        def test_single_key(key: str, port: int) -> tuple | None:
-            outbound = parse_key_to_config(key)
-            if not outbound:
+        temp_dir = os.path.join(os.path.dirname(__file__), "Temp")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        config = {
+            "log": {"loglevel": "error"},
+            "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
+            "outbounds": [outbound]
+        }
+
+        prefix = "_dns" if test_dns else "_test"
+        cfg_file = os.path.join(temp_dir, f"{prefix}_{port}.json")
+        proc = None
+        try:
+            with open(cfg_file, "w") as f:
+                json.dump(config, f)
+            proc = subprocess.Popen(["xray.exe", "-c", cfg_file],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    creationflags=subprocess.CREATE_NO_WINDOW,
+                                    errors='replace')
+            time.sleep(0.8)
+            proxies = {"http": f"socks5://127.0.0.1:{port}", "https": f"socks5://127.0.0.1:{port}"}
+            start = time.time()
+            resp = requests.get("http://ifconfig.me/ip", proxies=proxies, timeout=5)
+            if resp.status_code not in (200, 204):
                 return None
 
-            config = {
-                "log": {"loglevel": "error"},
-                "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}}],
-                "outbounds": [outbound]
-            }
-
-            cfg_file = os.path.join(temp_dir, f"_fast_{port}.json")
-            proc = None
-            try:
-                with open(cfg_file, "w") as f:
-                    json.dump(config, f)
-                proc = subprocess.Popen(["xray.exe", "-c", cfg_file],
-                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                        creationflags=subprocess.CREATE_NO_WINDOW,
-                                        errors='replace')
-                time.sleep(0.8)
-                proxies = {"http": f"socks5://127.0.0.1:{port}", "https": f"socks5://127.0.0.1:{port}"}
-                start = time.time()
-                resp = requests.get("http://ifconfig.me/ip", proxies=proxies, timeout=5)
-                if resp.status_code not in (200, 204):
-                    return None
+            if test_dns:
                 s = pysocks.socksocket()
                 s.set_proxy(pysocks.SOCKS5, "127.0.0.1", port)
                 s.settimeout(5)
@@ -3840,24 +4222,92 @@ class DMClientsApp:
                 s.send(b'\xaa\xbb\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x06google\x03com\x00\x00\x01\x00\x01')
                 s.recv(512)
                 s.close()
-                ping = (time.time() - start) * 1000
-                return (ping, key)
-            except Exception:
-                return None
-            finally:
-                if proc:
-                    proc.terminate()
-                    time.sleep(0.1)
-                if os.path.exists(cfg_file):
-                    os.remove(cfg_file)
+
+            ping = (time.time() - start) * 1000
+            return (ping, key) if test_dns else round(ping, 1)
+        except Exception:
+            return None
+        finally:
+            if proc:
+                proc.terminate()
+                time.sleep(0.1)
+            if os.path.exists(cfg_file):
+                os.remove(cfg_file)
+
+    def _batch_test_proxies(self, items: list, max_workers: int = 20, test_dns: bool = False,
+                            progress_callback=None) -> dict:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for key, port in items:
+                futures[executor.submit(self._test_proxy_xray, key, port, test_dns)] = port
+
+            completed = 0
+            for future in as_completed(futures):
+                port = futures[future]
+                result = future.result()
+                if result is not None:
+                    results[port] = result
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, len(items), len(results))
+
+        return results
+
+    @staticmethod
+    def _key_preview(key: str) -> str:
+        return key.split("#")[0][:60]
+
+    @staticmethod
+    def _ping_text(ping_ms: float | None) -> ft.Text:
+        if ping_ms is None:
+            return ft.Text("—", color="#F44336")
+        if ping_ms < 500:
+            return ft.Text(f"{ping_ms:.0f}ms", color="#4CAF50")
+        elif ping_ms < 1500:
+            return ft.Text(f"{ping_ms:.0f}ms", color="#FFC107")
+        else:
+            return ft.Text(f"{ping_ms:.0f}ms", color="#F44336")
+
+    def _build_proxy_rows(self, data: list, ping_results: dict = None):
+        rows = []
+        for item in data:
+            port = item["port"]
+            key = item["key"]
+            key_preview = key.split("#")[0][:50]
+            replace_btn = ft.FilledButton("Replace", icon=ft.Icons.REFRESH,
+                                          on_click=lambda e, p=port: self._replace_proxy(p), width=200,
+                                          style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
+            if ping_results is not None:
+                ping_ms = ping_results.get(port)
+                ping_cell = ft.DataCell(self._ping_text(ping_ms))
+            else:
+                ping_cell = ft.DataCell(ft.Text("—"))
+
+            rows.append(ft.DataRow(cells=[
+                ft.DataCell(ft.Text(str(port))),
+                ft.DataCell(ft.Text(key_preview)),
+                ft.DataCell(replace_btn),
+                ping_cell,
+            ]))
+        return rows
+
+    # ========== FAST PROXIES ==========
+    def fast_proxies(self, e):
+        e.control.disabled = True
+        e.control.update()
+
+        import random
+        import requests
 
         def run_fast_proxies():
             FAST_URL = "https://raw.githubusercontent.com/lothiann/DMClients/refs/heads/main/fastproxies.json"
-            MAX_WORKERS = 20
-
             N = (self.NUM_CLIENTS + self.clients_per_proxy - 1) // self.clients_per_proxy
             self.add_log(f"⚡ Fast proxies: need {N} proxies for {self.NUM_CLIENTS} clients, {self.clients_per_proxy} per proxy")
 
+            # --- Load keys ---
             try:
                 r = requests.get(FAST_URL, timeout=10)
                 r.raise_for_status()
@@ -3879,29 +4329,24 @@ class DMClientsApp:
                 self.add_log("❌ No keys found")
                 return
 
+            # --- Test all keys ---
             self.add_log("⏳ Testing proxies (HTTP + DNS)...")
-            working = []
-            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-                futures = {}
-                port = 30000
-                for key in raw_keys:
-                    port += 1
-                    futures[executor.submit(test_single_key, key, port)] = key
+            items = [(key, 30000 + i + 1) for i, key in enumerate(raw_keys)]
 
-                completed = 0
-                for future in as_completed(futures):
-                    completed += 1
-                    result = future.result()
-                    if result:
-                        working.append(result)
-                    if completed % 50 == 0:
-                        self.add_log(f"   Tested {completed}/{len(raw_keys)}, working: {len(working)}")
+            def on_progress(completed, total, working):
+                if completed % 50 == 0:
+                    self.add_log(f"   Tested {completed}/{total}, working: {working}")
 
+            results = self._batch_test_proxies(items, max_workers=20, test_dns=True, progress_callback=on_progress)
+
+            working = list(results.values())
             self.add_log(f"✅ Fast test finished: {len(working)} working proxies")
+
             if not working:
                 self.add_log("❌ No working proxies found")
                 return
 
+            # --- Select and save ---
             random.shuffle(working)
             selected = working[:N] if len(working) >= N else working
             if len(selected) < N:
@@ -3909,11 +4354,8 @@ class DMClientsApp:
 
             proxies_list = []
             for idx, (ping, key) in enumerate(selected):
-                proxies_list.append({
-                    "port": 10801 + idx,
-                    "key": key
-                })
-                self.add_log(f"   Selected: {key_preview(key)} ({ping:.0f}ms) -> port {10801 + idx}")
+                proxies_list.append({"port": 10801 + idx, "key": key})
+                self.add_log(f"   Selected: {self._key_preview(key)} ({ping:.0f}ms) -> port {10801 + idx}")
 
             settings_dir = os.path.join(os.path.dirname(__file__), "Settings")
             os.makedirs(settings_dir, exist_ok=True)
@@ -3924,7 +4366,76 @@ class DMClientsApp:
             self.add_log(f"💾 Saved {len(proxies_list)} fast proxies to {json_path}")
             self._refresh_proxies_table()
 
-        asyncio.create_task(asyncio.to_thread(run_fast_proxies))
+        def run_and_unlock():
+            try:
+                run_fast_proxies()
+            finally:
+                e.control.disabled = False
+                self._loop.call_soon_threadsafe(e.control.update)
+        try:
+            asyncio.create_task(asyncio.to_thread(run_and_unlock))
+        except RuntimeError:
+            pass
+
+    # ========== PING PROXIES ==========
+    def _ping_proxies(self, e=None):
+        if e:
+            e.control.disabled = True
+            e.control.update()
+
+        json_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
+        if not os.path.exists(json_path):
+            if e:
+                e.control.disabled = False
+                e.control.update()
+            self.add_log("❌ proxies.json not found")
+            return
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as ex:
+            if e:
+                e.control.disabled = False
+                e.control.update()
+            self.add_log(f"❌ Error reading proxies.json: {ex}")
+            return
+
+        if not data:
+            if e:
+                e.control.disabled = False
+                e.control.update()
+            self.add_log("❌ No proxies to ping")
+            return
+
+        def _run_ping():
+            items = [(item["key"], 40000 + i + 1) for i, item in enumerate(data)]
+            results = self._batch_test_proxies(items, max_workers=20, test_dns=False)
+
+            # Build port -> ping_ms mapping (results key is test_port, need real port)
+            port_to_data = {i + 1: item for i, item in enumerate(data)}
+            ping_by_port = {}
+            for i, item in enumerate(data):
+                test_port = 40000 + i + 1
+                ping_by_port[item["port"]] = results.get(test_port)
+
+            self.proxy_table.rows = self._build_proxy_rows(data, ping_by_port)
+            try:
+                self.proxy_table.update()
+            except Exception:
+                pass
+
+        def run_and_unlock():
+            try:
+                _run_ping()
+            finally:
+                if e:
+                    e.control.disabled = False
+                    self._loop.call_soon_threadsafe(e.control.update)
+        try:
+            asyncio.create_task(asyncio.to_thread(run_and_unlock))
+        except RuntimeError:
+            pass
 
     def toggle_proxies(self, e):
         btn = e.control
@@ -3952,6 +4463,7 @@ class DMClientsApp:
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
+            env["COLUMNS"] = "200"
             proc_ports = subprocess.Popen(
                 [sys.executable, "-u", ports_script],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3974,7 +4486,10 @@ class DMClientsApp:
                     self.add_log(f"[PortsProxies] Finished (code {proc_ports.returncode})")
                     if getattr(self, 'ports_proxies_proc', None) == proc_ports:
                         self.ports_proxies_proc = None
-            asyncio.create_task(asyncio.to_thread(read_ports))
+            try:
+                asyncio.create_task(asyncio.to_thread(read_ports))
+            except RuntimeError:
+                pass
             proxifyre_path = os.path.join(os.path.dirname(__file__), "ProxiFyre", "ProxiFyre.exe")
             if os.path.exists(proxifyre_path):
                 try:
@@ -4001,7 +4516,10 @@ class DMClientsApp:
                             self.add_log(f"[ProxiFyre] Finished (code {proc_prox.returncode})")
                             if getattr(self, 'proxifyre_proc', None) == proc_prox:
                                 self.proxifyre_proc = None
-                    asyncio.create_task(asyncio.to_thread(read_proxifyre))
+                    try:
+                        asyncio.create_task(asyncio.to_thread(read_proxifyre))
+                    except RuntimeError:
+                        pass
                 except Exception as ex:
                     self.add_log(f"[ProxiFyre] Start error: {ex}")
             else:
@@ -4119,7 +4637,10 @@ class DMClientsApp:
 
         servers = data.get("servers", [])
         if servers:
-            asyncio.create_task(self._load_servers_async(servers))
+            try:
+                asyncio.create_task(self._load_servers_async(servers))
+            except RuntimeError:
+                self.add_log("❌ Failed to load servers")
         else:
             self._progress_bar.visible = False
             self._progress_bar.update()
@@ -4220,7 +4741,10 @@ class DMClientsApp:
         self.hop_status.value = "Running..."
         self.hop_status.color = "#4CAF50"
         self.hop_status.update()
-        self._hop_task = asyncio.create_task(self._server_hop_loop())
+        try:
+            self._hop_task = asyncio.create_task(self._server_hop_loop())
+        except RuntimeError:
+            self.add_log("❌ Failed to start server hop")
 
     def _stop_server_hop(self):
         self._hop_running = False
@@ -4261,7 +4785,7 @@ class DMClientsApp:
                     continue
 
                 if self.hop_random_all_cb.value:
-                    selected_clients = self.get_selected_clients()
+                    selected_clients = self.get_selected_control_cids()
                     if not selected_clients:
                         self.add_log("❌ No clients selected for hop")
                         await asyncio.sleep(1)
@@ -4277,7 +4801,10 @@ class DMClientsApp:
                     for cid in selected_clients:
                         chosen = random.choice(filtered)
                         ip_port = chosen[4]
-                        asyncio.create_task(self._hop_to_server(cid, ip_port))
+                        try:
+                            asyncio.create_task(self._hop_to_server(cid, ip_port))
+                        except RuntimeError:
+                            pass
             
                     self.hop_status.value = f"Running"
                     self.hop_status.update()
@@ -4334,6 +4861,8 @@ def main(page: ft.Page):
         app.control_server.stop()
         app.client_manager.stop_all()
         app.bridge_receiver.stop()
+        if hasattr(app, '_server_mgr'):
+            app._server_mgr.stop()
         os.system("taskkill /F /IM xray.exe 2>nul")
         os.system("taskkill /F /IM proxifyre.exe 2>nul")
         if getattr(app, 'optimal_proxies_proc', None):
@@ -4346,6 +4875,7 @@ def main(page: ft.Page):
     page.on_close = on_close
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     if sys.platform == "win32":
         try:
             import winloop

@@ -1,14 +1,15 @@
 #include "bridge.h"
 
+#include <base/time.h>
+
 #include <engine/client.h>
 #include <engine/console.h>
 
 #include <game/client/gameclient.h>
-#include <base/time.h>
 
+#include <iomanip>
 #include <random>
 #include <sstream>
-#include <iomanip>
 
 #if defined(CONF_FAMILY_WINDOWS)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -45,7 +46,8 @@ static void ConSync(IConsole::IResult *pResult, void *pUserData)
 	CBridge *pBridge = (CBridge *)pUserData;
 	std::string newToken = GenerateToken();
 	std::string ctrl_msg = "TOKEN " + newToken + "\n";
-	send((SOCKET)pBridge->m_Socket, ctrl_msg.c_str(), (int)ctrl_msg.size(), 0);
+	if(pBridge->m_Socket != (unsigned long long)-1)
+		send((SOCKET)pBridge->m_Socket, ctrl_msg.c_str(), (int)ctrl_msg.size(), 0);
 	if(pBridge->m_SendConnected)
 	{
 		std::string bridge_msg = "TOKEN " + newToken + "\n";
@@ -60,7 +62,9 @@ CBridge::CBridge() :
 	m_SendConnected(false),
 	m_pGameClient(nullptr),
 	m_pClient(nullptr),
-	m_LastSendTime(0)
+	m_pConsole(nullptr),
+	m_LastSendTime(0),
+	m_LastReconnectAttempt(0)
 {
 }
 
@@ -80,23 +84,18 @@ CBridge::~CBridge()
 #endif
 }
 
-void CBridge::Init(IGameClient *pGameClient, IClient *pClient, IConsole *pConsole)
+bool CBridge::TryConnectControl()
 {
-	m_pGameClient = pGameClient;
-	m_pClient = pClient;
-	m_LastSendTime = time_get();
-
-	pConsole->Register("c_sync", "", CFGFLAG_CLIENT, ConSync, this, "Sync token with control server");
-
-	std::string token = GenerateToken();
-
+	/* Close old socket if any */
+	if(m_Socket != (unsigned long long)-1)
+	{
 #if defined(CONF_FAMILY_WINDOWS)
-	WSADATA wsaData;
-	if(WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-		return;
+		closesocket((SOCKET)m_Socket);
+#else
+		close((int)m_Socket);
 #endif
-
-	int flag = 1;
+		m_Socket = (unsigned long long)-1;
+	}
 
 #if defined(CONF_FAMILY_WINDOWS)
 	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -104,35 +103,94 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient, IConsole *pConsol
 	int s = socket(AF_INET, SOCK_STREAM, 0);
 #endif
 	if(s == (unsigned long long)-1)
-		return;
-	m_Socket = (unsigned long long)s;
+		return false;
+
+	/* 1-second connect timeout via non-blocking + select */
+#if defined(CONF_FAMILY_WINDOWS)
+	unsigned long mode = 1;
+	ioctlsocket(s, FIONBIO, &mode);
+#else
+	int flags = fcntl(s, F_GETFL, 0);
+	fcntl(s, F_SETFL, flags | O_NONBLOCK);
+#endif
 
 	struct sockaddr_in serv_addr;
 	serv_addr.sin_family = AF_INET;
 	serv_addr.sin_port = htons(5555);
 	serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-	if(connect((SOCKET)m_Socket, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
-	{
-		m_Connected = false;
-	}
-	else
-	{
-		m_Connected = true;
-		setsockopt((SOCKET)m_Socket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-#if defined(CONF_FAMILY_WINDOWS)
-		unsigned long mode = 1;
-		ioctlsocket((SOCKET)m_Socket, FIONBIO, &mode);
-#else
-		int flags = fcntl((int)m_Socket, F_GETFL, 0);
-		fcntl((int)m_Socket, F_SETFL, flags | O_NONBLOCK);
-#endif
+	int res = connect((SOCKET)s, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+	bool connected = false;
 
+	if(res == 0)
+	{
+		connected = true;
+	}
 #if defined(CONF_FAMILY_WINDOWS)
-		Sleep(3500);
+	else if(WSAGetLastError() == WSAEWOULDBLOCK)
+#else
+	else if(errno == EINPROGRESS)
 #endif
-		std::string ctrl_msg = "TOKEN " + token + "\n";
+	{
+		fd_set writefds;
+		FD_ZERO(&writefds);
+		FD_SET(s, &writefds);
+		struct timeval tv;
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		int sel = select(s + 1, nullptr, &writefds, nullptr, &tv);
+		if(sel > 0)
+		{
+			int err = 0;
+			socklen_t len = sizeof(err);
+			getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
+			if(err == 0)
+				connected = true;
+		}
+	}
+
+	if(!connected)
+	{
+#if defined(CONF_FAMILY_WINDOWS)
+		closesocket(s);
+#else
+		close(s);
+#endif
+		return false;
+	}
+
+	/* Connected — set TCP_NODELAY + keep non-blocking */
+	int flag = 1;
+	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
+
+	m_Socket = (unsigned long long)s;
+	m_Connected = true;
+
+	/* Send token after short delay (server needs time to register) */
+#if defined(CONF_FAMILY_WINDOWS)
+	Sleep(100);
+#endif
+	if(!m_Token.empty())
+	{
+		std::string ctrl_msg = "TOKEN " + m_Token + "\n";
 		send((SOCKET)m_Socket, ctrl_msg.c_str(), (int)ctrl_msg.size(), 0);
+	}
+
+	dbg_msg("bridge", "control connected (port 5555)");
+	return true;
+}
+
+bool CBridge::TryConnectBridge()
+{
+	/* Close old socket if any */
+	if(m_SendSocket != (unsigned long long)-1)
+	{
+#if defined(CONF_FAMILY_WINDOWS)
+		closesocket((SOCKET)m_SendSocket);
+#else
+		close((int)m_SendSocket);
+#endif
+		m_SendSocket = (unsigned long long)-1;
 	}
 
 #if defined(CONF_FAMILY_WINDOWS)
@@ -142,37 +200,103 @@ void CBridge::Init(IGameClient *pGameClient, IClient *pClient, IConsole *pConsol
 #endif
 	if(send_s == (unsigned long long)-1)
 	{
-		dbg_msg("bridge", "failed to create send socket");
-		return;
+		dbg_msg("bridge", "failed to create bridge socket");
+		return false;
 	}
-	m_SendSocket = (unsigned long long)send_s;
+
+	/* Non-blocking connect */
+#if defined(CONF_FAMILY_WINDOWS)
+	unsigned long mode = 1;
+	ioctlsocket(send_s, FIONBIO, &mode);
+#else
+	int flags = fcntl(send_s, F_GETFL, 0);
+	fcntl(send_s, F_SETFL, flags | O_NONBLOCK);
+#endif
 
 	struct sockaddr_in send_addr;
 	send_addr.sin_family = AF_INET;
 	send_addr.sin_port = htons(5556);
 	send_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-	if(connect((SOCKET)m_SendSocket, (struct sockaddr *)&send_addr, sizeof(send_addr)) < 0)
+	int res = connect((SOCKET)send_s, (struct sockaddr *)&send_addr, sizeof(send_addr));
+	bool connected = false;
+
+	if(res == 0)
 	{
-		dbg_msg("bridge", "failed to connect to send port 5556");
-		m_SendConnected = false;
+		connected = true;
 	}
-	else
-	{
-		m_SendConnected = true;
-		setsockopt((SOCKET)m_SendSocket, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
-		int sndbuf = 256 * 1024;
-		setsockopt((SOCKET)m_SendSocket, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
 #if defined(CONF_FAMILY_WINDOWS)
-		unsigned long mode = 1;
-		ioctlsocket((SOCKET)m_SendSocket, FIONBIO, &mode);
+	else if(WSAGetLastError() == WSAEWOULDBLOCK)
 #else
-		int flags = fcntl((int)m_SendSocket, F_GETFL, 0);
-		fcntl((int)m_SendSocket, F_SETFL, flags | O_NONBLOCK);
+	else if(errno == EINPROGRESS)
 #endif
-		std::string bridge_msg = "TOKEN " + token + "\n";
+	{
+		fd_set writefds;
+		FD_ZERO(&writefds);
+		FD_SET(send_s, &writefds);
+		struct timeval tv;
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		int sel = select(send_s + 1, nullptr, &writefds, nullptr, &tv);
+		if(sel > 0)
+		{
+			int err = 0;
+			socklen_t len = sizeof(err);
+			getsockopt(send_s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
+			if(err == 0)
+				connected = true;
+		}
+	}
+
+	if(!connected)
+	{
+#if defined(CONF_FAMILY_WINDOWS)
+		closesocket(send_s);
+#else
+		close(send_s);
+#endif
+		return false;
+	}
+
+	int flag = 1;
+	setsockopt((SOCKET)send_s, IPPROTO_TCP, TCP_NODELAY, (const char *)&flag, sizeof(flag));
+	int sndbuf = 256 * 1024;
+	setsockopt((SOCKET)send_s, SOL_SOCKET, SO_SNDBUF, (const char *)&sndbuf, sizeof(sndbuf));
+
+	m_SendSocket = (unsigned long long)send_s;
+	m_SendConnected = true;
+
+	if(!m_Token.empty())
+	{
+		std::string bridge_msg = "TOKEN " + m_Token + "\n";
 		send((SOCKET)m_SendSocket, bridge_msg.c_str(), (int)bridge_msg.size(), 0);
 	}
+
+	dbg_msg("bridge", "bridge connected (port 5556)");
+	return true;
+}
+
+void CBridge::Init(IGameClient *pGameClient, IClient *pClient, IConsole *pConsole)
+{
+	m_pGameClient = pGameClient;
+	m_pClient = pClient;
+	m_pConsole = pConsole;
+	m_LastSendTime = time_get();
+	m_LastReconnectAttempt = time_get();
+
+	pConsole->Register("c_sync", "", CFGFLAG_CLIENT, ConSync, this, "Sync token with control server");
+
+	m_Token = GenerateToken();
+
+#if defined(CONF_FAMILY_WINDOWS)
+	WSADATA wsaData;
+	if(WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
+		return;
+#endif
+
+	/* Try initial connection (non-blocking with 1s timeout) */
+	TryConnectControl();
+	TryConnectBridge();
 }
 
 void CBridge::SendGameState()
@@ -288,13 +412,42 @@ void CBridge::SendGameState()
 		{
 			dbg_msg("bridge", "send error, disconnecting send socket");
 			m_SendConnected = false;
+#if defined(CONF_FAMILY_WINDOWS)
 			closesocket((SOCKET)m_SendSocket);
+#else
+			close((int)m_SendSocket);
+#endif
+			m_SendSocket = (unsigned long long)-1;
 		}
 	}
 }
 
 void CBridge::Update(IConsole *pConsole)
 {
+	int64_t Now = time_get();
+
+	/* ── Auto-reconnect: try every 5 seconds if not connected ── */
+	if((!m_Connected || !m_SendConnected) &&
+		(Now - m_LastReconnectAttempt >= time_freq() * 5))
+	{
+		m_LastReconnectAttempt = Now;
+
+		if(!m_Connected)
+		{
+			if(TryConnectControl())
+			{
+				/* Control reconnected — also try bridge */
+				if(!m_SendConnected)
+					TryConnectBridge();
+			}
+		}
+		else if(!m_SendConnected)
+		{
+			TryConnectBridge();
+		}
+	}
+
+	/* ── Receive commands from control server ── */
 	if(m_Connected)
 	{
 		char aBuf[4096];
@@ -312,6 +465,38 @@ void CBridge::Update(IConsole *pConsole)
 					pConsole->ExecuteLine(cmd.c_str(), -1, -1);
 				}
 				m_CommandBuffer.erase(0, pos + 1);
+			}
+		}
+		else if(nBytes == 0)
+		{
+			/* Server closed connection gracefully */
+			dbg_msg("bridge", "control server disconnected");
+			m_Connected = false;
+#if defined(CONF_FAMILY_WINDOWS)
+			closesocket((SOCKET)m_Socket);
+#else
+			close((int)m_Socket);
+#endif
+			m_Socket = (unsigned long long)-1;
+		}
+		else
+		{
+			/* nBytes < 0 — check for real error */
+#if defined(CONF_FAMILY_WINDOWS)
+			int err = WSAGetLastError();
+			if(err != WSAEWOULDBLOCK)
+#else
+			if(errno != EAGAIN && errno != EWOULDBLOCK)
+#endif
+			{
+				dbg_msg("bridge", "control recv error, disconnecting");
+				m_Connected = false;
+#if defined(CONF_FAMILY_WINDOWS)
+				closesocket((SOCKET)m_Socket);
+#else
+				close((int)m_Socket);
+#endif
+				m_Socket = (unsigned long long)-1;
 			}
 		}
 	}
