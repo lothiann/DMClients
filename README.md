@@ -437,7 +437,6 @@ Placeholders can be used in any command sent through the UI or macros:
 
 ---
 
-```
 ## Files
 
 Project file/folder structure:
