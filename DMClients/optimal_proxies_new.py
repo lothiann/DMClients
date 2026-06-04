@@ -44,7 +44,7 @@ TARGET_SERVER = "45.141.57.22:8390"
 PROXIFYRE_PATH = r"proxifyre/proxifyre.exe"
 DDNET_PATH = r"ddnets-19.9-win64/hddnet1.exe"
 
-PROTOCOLS = ("vless://", "vmess://", "ss://", "trojan://", "hysteria://", "hysteria2://", "socks5://", "socks://")
+PROTOCOLS = ("vless://", "vmess://", "ss://", "shadowsocks://", "trojan://", "hysteria://", "hysteria2://", "hy://", "hy2://", "socks5://", "socks://")
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -92,39 +92,46 @@ if getattr(sys, "frozen", False):
 # ─── Subscriptions ────────────────────────────────────────────────────────────
 
 _DEFAULT_SUBS = [
-    "https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/configs/url_work.txt",
-    "https://raw.githubusercontent.com/Ai123999/WhiteKeys/refs/heads/main/WhiteKeys",
-    "https://gistpad.com/raw/miata-vpn-free-vless-keys-reverse-engineer-s-basement",
-    "https://raw.githubusercontent.com/pyatovsergey0105-maker/-/refs/heads/main/Whie_spiksik",
-    "https://github.com/KiryaScript/white-lists/raw/refs/heads/main/githubmirror/28.txt",
-    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
-    "https://raw.githubusercontent.com/clowovx/clowovxVPN/refs/heads/main/clowovxVPN",
+    # Working:
     "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt",
     "https://raw.githubusercontent.com/Ai123999/WhiteKeys/refs/heads/main/WhiteKeys",
-    # "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha-All-Type.txt",
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "https://tinyurl.com/SemqkaVLESS",
-    "https://raw.githubusercontent.com/cinev505/VlessTrogan-vpn-key/refs/heads/main/WhiteList-VPN-Vless",
-    "https://raw.githubusercontent.com/Reallyza/ReallyzaVpn/refs/heads/main/ALL%20CONF-WH%2BWIFI",
-    "https://github.com/Reallyza/ReallyzaVpn/blob/main/ALL%20CONF-WH%2BWIFI",
-    "https://raw.githubusercontent.com/v0id9/vpn-configs/refs/heads/main/vpn.txt",
-    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/vmess.txt",
-    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/vless.txt",
-    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/trojan.txt",
-    "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/Splitted-By-Protocol/ss.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt",
-    "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/refs/heads/main/configs/all.txt",
+    "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt",
+    "https://openproxylist.com/v2ray/rawlist/subscribe",
 
-    "https://gist.githubusercontent.com/DestroyST6767/f00837ad379aa3272183fdaabcfd50da/raw",
-    "https://raw.githubusercontent.com/Reallyza/ReallyzaVpn/refs/heads/main/ALL%20CONF-WH%2BWIFI",
-    "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt",
-    "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/refs/heads/main/proxies/protocols/socks5/data.txt",
+    # 5000+:
+    # "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/refs/heads/main/proxies/protocols/socks5/data.txt",
+
+    # 1500+:
+    # "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/refs/heads/main/subscriptions/v2ray/all_sub.txt",
+    # "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/All_Configs_base64_Sub.txt",
     "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/refs/heads/main/configs/all.txt",
+    # "https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/all-proxies.txt",
+    "https://raw.githubusercontent.com/v0id9/vpn-configs/refs/heads/main/vpn.txt",
+    # "https://raw.githubusercontent.com/Danialsamadi/v2go/refs/heads/main/AllConfigsSub.txt",
+    # "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha-All-Type.txt",
+
+    # 300–1500:
+    "https://raw.githubusercontent.com/Reallyza/ReallyzaVpn/refs/heads/main/ALL%20CONF-WH%2BWIFI",
+    "https://raw.githubusercontent.com/KiryaScript/white-lists/refs/heads/main/githubmirror/28.txt",
     "https://raw.githubusercontent.com/pornnewbee/free-vless-VPN/refs/heads/main/vless.txt",
-    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/refs/heads/main/Protocols/shadowsocks.txt",
-    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/refs/heads/main/Protocols/trojan.txt",
-    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/refs/heads/main/Protocols/vless.txt",
-    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/refs/heads/main/Protocols/vmess.txt",
+    "https://raw.githubusercontent.com/zieng2/wl/main/vless_lite.txt",
+    "https://raw.githubusercontent.com/SoliSpirit/SolVPN/refs/heads/main/all_configs.txt",
+
+    # 100–300:
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/refs/heads/main/V2RAY_RAW.txt",
+
+    # 10–100:
+    "https://gist.githubusercontent.com/DestroyST6767/f00837ad379aa3272183fdaabcfd50da/raw",
+    "https://raw.githubusercontent.com/cinev505/VlessTrogan-vpn-key/refs/heads/main/WhiteList-VPN-Vless", 
+    "https://raw.githubusercontent.com/pyatovsergey0105-maker/-/refs/heads/main/Whie_spiksik",
+
+    # <10:
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/WHITE-SNI-RU-all.txt",
+    "https://tinyurl.com/SemqkaVLESS",
+    "https://gistpad.com/raw/miata-vpn-free-vless-keys-reverse-engineer-s-basement",
+    "https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/configs/url_work.txt",
+    "https://raw.githubusercontent.com/clowovx/clowovxVPN/refs/heads/main/clowovxVPN",
 ]
 
 def load_subs() -> list[str]:
@@ -382,19 +389,105 @@ def test_proxy_udp_dns(proxy_port: int) -> float | None:
 
 # ─── Key parsing ──────────────────────────────────────────────────────────────
 
+def _decode_vmess_base64(key: str) -> str:
+    """Try to decode vmess://base64(json) into a standard vmess URI
+    that python_v2ray can parse. Returns original key if decoding fails."""
+    if not key.startswith("vmess://"):
+        return key
+    payload = key[len("vmess://"):]
+    if not payload:
+        return key
+    try:
+        # Fix base64 padding + handle URL-safe variants
+        padded = payload + "=" * (-len(payload) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        obj = json.loads(decoded)
+        if not isinstance(obj, dict):
+            return key
+        # Reconstruct a standard vmess:// URI from the JSON fields
+        # vmess JSON format: v, ps, add, port, id, aid, net, type, host, path, tls, sni, ...
+        v = obj.get("v", "2")
+        add = obj.get("add", "")
+        port = obj.get("port", "")
+        uid = obj.get("id", "")
+        aid = obj.get("aid", 0)
+        net = obj.get("net", "tcp")
+        ttype = obj.get("type", "none")        # kcp header type
+        host = obj.get("host", "")
+        path = obj.get("path", "")
+        tls = obj.get("tls", "")
+        sni = obj.get("sni", "")
+        alpn = obj.get("alpn", "")
+        fp = obj.get("fp", "")
+        pbk = obj.get("pbk", "")
+        sid = obj.get("sid", "")
+        flow = obj.get("flow", "")
+        scy = obj.get("scy", "auto")
+
+        if not add or not port or not uid:
+            return key
+
+        # Build SIP002-style vmess URI
+        # vmess://uuid@address:port?params#remark
+        params = []
+        params.append(f"type={net}")
+        if ttype and ttype != "none":
+            params.append(f"headerType={ttype}")
+        if host:
+            params.append(f"host={host}")
+        if path:
+            params.append(f"path={path}")
+        if tls:
+            params.append(f"security={tls}")
+        else:
+            params.append("security=none")
+        if sni:
+            params.append(f"sni={sni}")
+        if alpn:
+            params.append(f"alpn={alpn}")
+        if fp:
+            params.append(f"fp={fp}")
+        if pbk:
+            params.append(f"pbk={pbk}")
+        if sid:
+            params.append(f"sid={sid}")
+        if flow:
+            params.append(f"flow={flow}")
+        if scy and scy != "auto":
+            params.append(f"encryption={scy}")
+
+        query = "&".join(params)
+        remark = obj.get("ps", "")
+        fragment = f"#{remark}" if remark else ""
+
+        return f"vmess://{uid}@{add}:{port}?{query}{fragment}"
+    except Exception:
+        return key
+
+
 def parse_key(key: str) -> dict | None:
-    """URI → Xray outbound config."""
     try:
         from python_v2ray.config_parser import parse_uri
 
         if key.startswith("socks5://"):
             key = "socks://" + key[len("socks5://"):]
+        elif key.startswith("shadowsocks://"):
+            key = "ss://" + key[len("shadowsocks://"):]
+        elif key.startswith("hy://"):
+            key = "hysteria://" + key[len("hy://"):]
+        elif key.startswith("hy2://"):
+            key = "hysteria2://" + key[len("hy2://"):]
+
+        # vmess://base64(json) — try decoding before parse_uri
+        if key.startswith("vmess://"):
+            key = _decode_vmess_base64(key)
 
         p = parse_uri(key)
         server = getattr(p, "address", None) or getattr(p, "server", None) or getattr(p, "host", None)
         if not server:
             return None
 
+        # ---------- VLESS / VMESS ----------
         if p.protocol in ("vless", "vmess"):
             ob: dict = {
                 "protocol": p.protocol,
@@ -405,39 +498,224 @@ def parse_key(key: str) -> dict | None:
                 "streamSettings": {"network": getattr(p, "network", "tcp"),
                                    "security": getattr(p, "security", "none")}
             }
-            sec = getattr(p, "security", "")
-            if sec == "reality":
-                ob["streamSettings"]["realitySettings"] = {
-                    "serverName": getattr(p, "sni", ""), "fingerprint": "chrome",
-                    "publicKey": getattr(p, "pbk", ""), "shortId": getattr(p, "sid", ""),
-                    "spiderX": "/"}
-            elif sec == "tls":
-                ob["streamSettings"]["tlsSettings"] = {
-                    "serverName": getattr(p, "sni", server), "allowInsecure": True}
+            network = ob["streamSettings"]["network"]
+            security = ob["streamSettings"]["security"]
+
+            # WebSocket
+            if network == "ws":
+                ws = {}
+                if hasattr(p, "path"):
+                    ws["path"] = p.path
+                if hasattr(p, "host"):
+                    ws["headers"] = {"Host": p.host}
+                ob["streamSettings"]["wsSettings"] = ws
+
+            # gRPC
+            elif network == "grpc":
+                grpc = {}
+                if hasattr(p, "serviceName"):
+                    grpc["serviceName"] = p.serviceName
+                if hasattr(p, "mode"):
+                    grpc["multiMode"] = p.mode == "multi"
+                ob["streamSettings"]["grpcSettings"] = grpc
+
+            # HTTP/2
+            elif network == "http":
+                http = {}
+                if hasattr(p, "host"):
+                    http["host"] = [p.host] if isinstance(p.host, str) else p.host
+                if hasattr(p, "path"):
+                    http["path"] = p.path
+                ob["streamSettings"]["httpSettings"] = http
+
+            # mKCP
+            elif network == "kcp":
+                kcp = {"congestion": True}
+                if hasattr(p, "header"):
+                    kcp["header"] = {"type": p.header}
+                elif hasattr(p, "headerType"):
+                    kcp["header"] = {"type": p.headerType}
+                if hasattr(p, "seed"):
+                    kcp["seed"] = p.seed
+                ob["streamSettings"]["kcpSettings"] = kcp
+
+            # QUIC (used by some configs as network type)
+            elif network == "quic":
+                quic = {}
+                if hasattr(p, "header"):
+                    quic["header"] = {"type": p.header}
+                elif hasattr(p, "headerType"):
+                    quic["header"] = {"type": p.headerType}
+                if hasattr(p, "quicSecurity"):
+                    quic["security"] = p.quicSecurity
+                if hasattr(p, "key"):
+                    quic["key"] = p.key
+                ob["streamSettings"]["quicSettings"] = quic
+
+            # TLS / Reality
+            if security == "tls":
+                tls_cfg = {
+                    "serverName": getattr(p, "sni", server),
+                    "allowInsecure": getattr(p, "allowInsecure", False)
+                }
+                if hasattr(p, "fingerprint"):
+                    tls_cfg["fingerprint"] = p.fingerprint
+                if hasattr(p, "alpn"):
+                    alpn_val = p.alpn
+                    if isinstance(alpn_val, str):
+                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                    tls_cfg["alpn"] = alpn_val
+                ob["streamSettings"]["tlsSettings"] = tls_cfg
+            elif security == "reality":
+                reality_cfg = {
+                    "serverName": getattr(p, "sni", ""),
+                    "fingerprint": getattr(p, "fingerprint", "chrome"),
+                    "publicKey": getattr(p, "pbk", ""),
+                    "shortId": getattr(p, "sid", ""),
+                    "spiderX": getattr(p, "spiderX", "/")
+                }
+                if hasattr(p, "alpn"):
+                    alpn_val = p.alpn
+                    if isinstance(alpn_val, str):
+                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                    reality_cfg["alpn"] = alpn_val
+                ob["streamSettings"]["realitySettings"] = reality_cfg
             return ob
 
+        # ---------- Shadowsocks / SS ----------
         if p.protocol in ("shadowsocks", "ss"):
-            return {"protocol": "shadowsocks",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "method": getattr(p, "method", "chacha20-ietf-poly1305"),
-                        "password": getattr(p, "password", "")}]}}
+            out = {
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": server, "port": p.port,
+                    "method": getattr(p, "method", "chacha20-ietf-poly1305"),
+                    "password": getattr(p, "password", "")}]}
+            }
+            if hasattr(p, "plugin"):
+                out["settings"]["servers"][0]["plugin"] = p.plugin
+                if hasattr(p, "pluginOpts"):
+                    out["settings"]["servers"][0]["pluginOpts"] = p.pluginOpts
+            # SS can have transport too (ws, etc.)
+            ss_network = getattr(p, "network", None)
+            if ss_network and ss_network != "tcp":
+                out["streamSettings"] = {"network": ss_network}
+                if ss_network == "ws":
+                    ws = {}
+                    if hasattr(p, "path"):
+                        ws["path"] = p.path
+                    if hasattr(p, "host"):
+                        ws["headers"] = {"Host": p.host}
+                    out["streamSettings"]["wsSettings"] = ws
+            return out
 
+        # ---------- Trojan ----------
         if p.protocol == "trojan":
-            return {"protocol": "trojan",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "password": getattr(p, "password", getattr(p, "uuid", ""))}]},
-                    "streamSettings": {"security": "tls",
-                        "tlsSettings": {"serverName": getattr(p, "sni", server),
-                                        "allowInsecure": True}}}
+            network = getattr(p, "network", "tcp")
+            security = getattr(p, "security", "tls")
+            out = {
+                "protocol": "trojan",
+                "settings": {"servers": [{"address": server, "port": p.port,
+                    "password": getattr(p, "password", getattr(p, "uuid", ""))}]},
+                "streamSettings": {"network": network, "security": security}
+            }
+            # TLS settings
+            if security in ("tls", "reality"):
+                if security == "tls":
+                    tls_cfg = {
+                        "serverName": getattr(p, "sni", server),
+                        "allowInsecure": getattr(p, "allowInsecure", False)
+                    }
+                    if hasattr(p, "fingerprint"):
+                        tls_cfg["fingerprint"] = p.fingerprint
+                    if hasattr(p, "alpn"):
+                        alpn_val = p.alpn
+                        if isinstance(alpn_val, str):
+                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                        tls_cfg["alpn"] = alpn_val
+                    out["streamSettings"]["tlsSettings"] = tls_cfg
+                elif security == "reality":
+                    out["streamSettings"]["realitySettings"] = {
+                        "serverName": getattr(p, "sni", ""),
+                        "fingerprint": getattr(p, "fingerprint", "chrome"),
+                        "publicKey": getattr(p, "pbk", ""),
+                        "shortId": getattr(p, "sid", ""),
+                        "spiderX": getattr(p, "spiderX", "/")
+                    }
+            # Transport
+            if network == "ws":
+                ws = {}
+                if hasattr(p, "path"):
+                    ws["path"] = p.path
+                if hasattr(p, "host"):
+                    ws["headers"] = {"Host": p.host}
+                out["streamSettings"]["wsSettings"] = ws
+            elif network == "grpc":
+                grpc = {}
+                if hasattr(p, "serviceName"):
+                    grpc["serviceName"] = p.serviceName
+                if hasattr(p, "mode"):
+                    grpc["multiMode"] = p.mode == "multi"
+                out["streamSettings"]["grpcSettings"] = grpc
+            elif network == "kcp":
+                kcp = {"congestion": True}
+                if hasattr(p, "header"):
+                    kcp["header"] = {"type": p.header}
+                elif hasattr(p, "headerType"):
+                    kcp["header"] = {"type": p.headerType}
+                if hasattr(p, "seed"):
+                    kcp["seed"] = p.seed
+                out["streamSettings"]["kcpSettings"] = kcp
+            return out
 
+        # ---------- Hysteria / Hysteria2 ----------
         if p.protocol in ("hysteria", "hysteria2"):
-            return {"protocol": p.protocol,
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "password": getattr(p, "password", getattr(p, "auth", ""))}]},
-                    "streamSettings": {"network": "tcp", "security": "tls",
-                        "tlsSettings": {"serverName": getattr(p, "sni", server),
-                                        "allowInsecure": True}}}
+            out = {
+                "protocol": p.protocol,
+                "settings": {"servers": [{"address": server, "port": p.port,
+                    "password": getattr(p, "password", getattr(p, "auth", ""))}]},
+                "streamSettings": {"network": "udp", "security": "tls",
+                    "tlsSettings": {"serverName": getattr(p, "sni", server),
+                                    "allowInsecure": getattr(p, "allowInsecure", False)}}
+            }
+            # TLS fingerprint & alpn for Hysteria
+            if hasattr(p, "fingerprint"):
+                out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fingerprint
+            if hasattr(p, "alpn"):
+                alpn_val = p.alpn
+                if isinstance(alpn_val, str):
+                    alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                out["streamSettings"]["tlsSettings"]["alpn"] = alpn_val
 
+            # Hysteria1 доп. поля
+            if p.protocol == "hysteria":
+                if hasattr(p, "up"):
+                    out["settings"]["servers"][0]["up_mbps"] = p.up
+                if hasattr(p, "down"):
+                    out["settings"]["servers"][0]["down_mbps"] = p.down
+                if hasattr(p, "obfs"):
+                    out["settings"]["servers"][0]["obfs"] = p.obfs
+
+            # Hysteria2 доп. поля
+            if p.protocol == "hysteria2":
+                if hasattr(p, "obfs"):
+                    out["settings"]["servers"][0]["obfs"] = {
+                        "type": getattr(p, "obfs", "salamander")
+                    }
+                    if hasattr(p, "obfs_password"):
+                        out["settings"]["servers"][0]["obfs"]["password"] = p.obfs_password
+                    elif hasattr(p, "obfsPassword"):
+                        out["settings"]["servers"][0]["obfs"]["password"] = p.obfsPassword
+                if hasattr(p, "congestion_control_type"):
+                    out["settings"]["servers"][0]["congestion_control_type"] = p.congestion_control_type
+                elif hasattr(p, "congestion"):
+                    out["settings"]["servers"][0]["congestion_control_type"] = p.congestion
+                # up/down speed for hy2
+                if hasattr(p, "up"):
+                    out["settings"]["servers"][0]["up_mbps"] = p.up
+                if hasattr(p, "down"):
+                    out["settings"]["servers"][0]["down_mbps"] = p.down
+            return out
+
+        # ---------- SOCKS (работает без изменений) ----------
         if p.protocol == "socks":
             users = []
             user = getattr(p, "id", "")
@@ -447,7 +725,9 @@ def parse_key(key: str) -> dict | None:
             return {"protocol": "socks",
                     "settings": {"servers": [{"address": server, "port": p.port,
                                                "users": users}]}}
-    except Exception:
+    except Exception as e:
+        # Для отладки – замени pass на print, но не забудь убрать потом
+        print(f"Parse error: {e}")
         pass
     return None
 
@@ -979,22 +1259,30 @@ def main():
                 tls_key = "tlsSettings" if security == "tls" else "realitySettings"
                 sni = stream.get(tls_key, {}).get("serverName") or host
 
-            # ── TCP ping ──
-            tcp = tcp_ping(ip, port_srv)
+            # ── TCP/TLS prefilter (skip for Hysteria — it uses QUIC, not TCP) ──
+            protocol = outbound.get("protocol", "")
+            is_udp = protocol in ("hysteria", "hysteria2")
 
-            # ── TLS ping (if protocol requires it) ──
+            tcp = None
             tls = None
-            if needs_tls and tcp is not None:
-                tls = tls_ping(ip, port_srv, sni)
 
-            # ── Dead server? → skip ──
-            if tcp is None or (needs_tls and tls is None):
-                done = counter.inc()
-                with results_lock:
-                    pv = key_preview(key)[:45]
-                    console.print(f"  ❌ [{done}/{total}] {pv}")
-                    progress.update(task_id, advance=1)
-                return
+            if not is_udp:
+                # ── TCP ping ──
+                tcp = tcp_ping(ip, port_srv)
+
+                # ── TLS ping (if protocol requires it) ──
+                tls = None
+                if needs_tls and tcp is not None:
+                    tls = tls_ping(ip, port_srv, sni)
+
+                # ── Dead server? → skip ──
+                if tcp is None or (needs_tls and tls is None):
+                    done = counter.inc()
+                    with results_lock:
+                        pv = key_preview(key)[:45]
+                        console.print(f"  ❌ [{done}/{total}] {pv}")
+                        progress.update(task_id, advance=1)
+                    return
 
             # ── Ping passed → full xray test ──
             port = port_alloc(i)
@@ -1008,7 +1296,8 @@ def main():
                 if _shutdown.is_set():
                     return
                 pv = key_preview(key)[:45]
-                ping_parts = [f"TCP:{tcp}ms"]
+                if tcp is not None:
+                    ping_parts = [f"TCP:{tcp}ms"]
                 if needs_tls and tls is not None:
                     ping_parts.append(f"TLS:{tls}ms")
                 if res is not None:

@@ -501,5 +501,42 @@ void CBridge::Update(IConsole *pConsole)
 		}
 	}
 
+	/* ── Check bridge socket connection ── */
+	if(m_SendConnected)
+	{
+		char aBuf[64];
+		int nBytes = recv((SOCKET)m_SendSocket, aBuf, sizeof(aBuf) - 1, 0);
+		if(nBytes == 0)
+		{
+			dbg_msg("bridge", "bridge server disconnected");
+			m_SendConnected = false;
+#if defined(CONF_FAMILY_WINDOWS)
+			closesocket((SOCKET)m_SendSocket);
+#else
+			close((int)m_SendSocket);
+#endif
+			m_SendSocket = (unsigned long long)-1;
+		}
+		else if(nBytes < 0)
+		{
+#if defined(CONF_FAMILY_WINDOWS)
+			int err = WSAGetLastError();
+			if(err != WSAEWOULDBLOCK)
+#else
+			if(errno != EAGAIN && errno != EWOULDBLOCK)
+#endif
+			{
+				dbg_msg("bridge", "bridge recv error, disconnecting");
+				m_SendConnected = false;
+#if defined(CONF_FAMILY_WINDOWS)
+				closesocket((SOCKET)m_SendSocket);
+#else
+				close((int)m_SendSocket);
+#endif
+				m_SendSocket = (unsigned long long)-1;
+			}
+		}
+	}
+
 	SendGameState();
 }

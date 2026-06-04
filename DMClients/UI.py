@@ -106,6 +106,9 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
     next_control_id = [1]
     next_bridge_idx = [1]
 
+    # Bridge data queue for non-blocking processing
+    bridge_queue = asyncio.Queue(maxsize=5000)
+
     class ControlProc(asyncio.Protocol):
         def __init__(self):
             self.transport = None
@@ -205,12 +208,16 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
                 pass
 
         def data_received(self, data):
+            # Non-blocking: just enqueue lines for processing
             self.buffer += data.decode('utf-8', errors='replace')
             while '\n' in self.buffer:
                 line, self.buffer = self.buffer.split('\n', 1)
                 line = line.strip()
                 if line:
-                    _parse_bridge_line(line, self.cidx)
+                    try:
+                        bridge_queue.put_nowait((line, self.cidx))
+                    except asyncio.QueueFull:
+                        pass  # Drop on overflow
 
         def connection_lost(self, exc):
             bridge_clients.pop(self.cidx, None)
@@ -331,6 +338,19 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
                 _sync_dirty[0] = False
                 await asyncio.to_thread(_sync_shared_state)
 
+    async def _bridge_processor():
+        """Process bridge data with rate limiting to prevent event loop blocking."""
+        while True:
+            # Process up to 50 lines per iteration
+            for _ in range(50):
+                try:
+                    line, cidx = bridge_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                _parse_bridge_line(line, cidx)
+            # Yield control to other tasks
+            await asyncio.sleep(0.001)
+
     def _random_char() -> str:
         import random, string
         return random.choice(string.ascii_letters + string.digits + "._-")
@@ -348,15 +368,19 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
             return str(random.randint(0, max_val))
         cmd = re.sub(r'{ri-(\d+)}', replace_ri, cmd)
 
+        # Get names and dictionary from shared_state
+        names_list = shared_state.get('names', [])
+        dict_list = shared_state.get('dictionary', [])
+
         while "{n}" in cmd:
-            if _global_names:
-                cmd = cmd.replace("{n}", random.choice(_global_names), 1)
+            if names_list:
+                cmd = cmd.replace("{n}", random.choice(names_list), 1)
             else:
                 cmd = cmd.replace("{n}", "lol", 1)
 
         while "{d}" in cmd:
-            if _global_dictionary:
-                cmd = cmd.replace("{d}", random.choice(_global_dictionary), 1)
+            if dict_list:
+                cmd = cmd.replace("{d}", random.choice(dict_list), 1)
             else:
                 cmd = cmd.replace("{d}", "lol", 1)
 
@@ -415,6 +439,7 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
 
     poll_task = asyncio.create_task(_poll_commands())
     sync_task = asyncio.create_task(_periodic_sync())
+    bridge_task = asyncio.create_task(_bridge_processor())
 
     try:
         await asyncio.gather(
@@ -422,6 +447,7 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
             bridge_server.serve_forever(),
             poll_task,
             sync_task,
+            bridge_task,
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
@@ -430,6 +456,7 @@ async def _server_process_async(control_port, bridge_port, cmd_queue, event_queu
             if not task.done():
                 task.cancel()
         sync_task.cancel()
+        bridge_task.cancel()
         control_server.close()
         bridge_server.close()
         await control_server.wait_closed()
@@ -641,6 +668,8 @@ class ServerProcessManager:
         self._shared_state['bridge_token_map'] = {}
         self._shared_state['players'] = {}
         self._shared_state['server_info'] = {"name": "", "map": "", "gametype": "", "num_players": 0, "max_players": 0}
+        self._shared_state['names'] = []
+        self._shared_state['dictionary'] = []
 
         self._process = multiprocessing.Process(
             target=_server_process,
@@ -682,6 +711,15 @@ class ServerProcessManager:
             except Exception:
                 pass
             time.sleep(0.01)  # 100 Hz polling
+
+    def update_dictionaries(self, names: List[str], dictionary: List[str]):
+        """Update names and dictionary in shared state for placeholder replacement."""
+        if self._shared_state is not None:
+            try:
+                self._shared_state['names'] = list(names)
+                self._shared_state['dictionary'] = list(dictionary)
+            except Exception:
+                pass
 
     def stop(self):
         self._running = False
@@ -1907,6 +1945,11 @@ class DMClientsApp:
         self.MAX_LOG_LINES = 2000
         self.show_advanced_logs = False
 
+        # Command history for console
+        self.cmd_history = []
+        self.cmd_history_index = -1
+        self.cmd_saved_input = ""
+
         self.control_server = ControlServer()
         self.client_manager = HDDNetClientManager(self.add_log)
         self.control_server.set_log_callback(self.add_log)
@@ -2033,7 +2076,7 @@ class DMClientsApp:
                 if not self.console_container.visible:
                     return
 
-                self.page.update()
+                self._log_text.update()
 
                 if self._auto_scroll:
                     await asyncio.sleep(0.02)
@@ -2084,6 +2127,10 @@ class DMClientsApp:
         except Exception:
             self.dictionary = []
         _global_dictionary = self.dictionary
+
+        # Update server process manager if it exists
+        if hasattr(self, '_server_mgr') and self._server_mgr:
+            self._server_mgr.update_dictionaries(self.names, self.dictionary)
 
     def get_selected_clients(self) -> List[int]:
         return [i + 1 for i, cb in enumerate(self.send_checkboxes) if cb.value]
@@ -2204,7 +2251,7 @@ class DMClientsApp:
             self._update_connect_buttons()
 
             self.update_clients_stats()
-            self.page.update()
+            self.clients_table.update()
 
     def _update_connect_buttons(self):
         need_update = False
@@ -3363,14 +3410,44 @@ class DMClientsApp:
         except Exception:
             pass
 
+    def on_keyboard(self, e: ft.KeyboardEvent):
+        """Handle arrow keys for command history navigation."""
+        if not self.console_container.visible:
+            return
+
+        if e.key == "Arrow Up":
+            if self.cmd_history:
+                if self.cmd_history_index == -1:
+                    self.cmd_saved_input = self.page.input_field.value or ""
+                if self.cmd_history_index < len(self.cmd_history) - 1:
+                    self.cmd_history_index += 1
+                    self.page.input_field.value = self.cmd_history[-(self.cmd_history_index + 1)]
+                    self.page.input_field.update()
+
+        elif e.key == "Arrow Down":
+            if self.cmd_history_index > 0:
+                self.cmd_history_index -= 1
+                self.page.input_field.value = self.cmd_history[-(self.cmd_history_index + 1)]
+                self.page.input_field.update()
+            elif self.cmd_history_index == 0:
+                self.cmd_history_index = -1
+                self.page.input_field.value = self.cmd_saved_input
+                self.page.input_field.update()
+
     def on_send_click(self):
         if self.page.input_field.value:
             cmd = self.page.input_field.value.strip()
             if cmd:
                 self.add_log(f"> {cmd}")
                 self.send_command_to_clients(cmd)
+
+                # Add to history (no duplicates of last command)
+                if not self.cmd_history or self.cmd_history[-1] != cmd:
+                    self.cmd_history.append(cmd)
+                self.cmd_history_index = -1
+
                 self.page.input_field.value = ""
-                self.page.update()
+                self.page.input_field.update()
                 self.page.run_task(self.page.input_field.focus)
 
     def on_player_name_submit(self, e):
@@ -3681,7 +3758,7 @@ class DMClientsApp:
             self.send_action_command("c_attack 0")
             self.send_action_command("+left;+right;+jump;+fire;c_input left 0;c_input right 0;c_input fire 0")
             self.add_log("🕊️ Attack mode disabled")
-        self.page.update()
+        self.attack_enable_switch.update()
 
     def on_all_target_change(self, e):
         if self.all_target_cb.value:
@@ -3790,8 +3867,6 @@ class DMClientsApp:
             for ddnet_id in self.get_selected_clients():
                 if "Reached destination" in self.client_manager.client_log.get(ddnet_id, ""):
                     self.pathfinder_go_switch.value = False
-                    self.pathfinder_go_switch.update()
-                    self.send_action_command("c_pathfinder_go 0")
                     self.add_log(f"✅ Client #{ddnet_id} reached destination")
                     break
 
@@ -3832,7 +3907,6 @@ class DMClientsApp:
                 button.content = ft.Text("Connect")
                 button.icon = ft.Icons.PLAY_ARROW
         button.update()
-        self.page.update()
 
     def toggle_all_clients(self, e):
         running_count = sum(1 for i in range(1, self.NUM_CLIENTS + 1) if self.client_manager.is_running(i))
@@ -3874,7 +3948,7 @@ class DMClientsApp:
 
         self.all_clients_btn.update()
         self.update_clients_stats()
-        self.page.update()
+        self.clients_table.update()
 
     async def players_tab_loop(self):
         weapon_names = {0: "Hammer", 1: "Pistol", 2: "Shotgun", 3: "Rocket", 4: "Laser", 5: "Ninja"}
@@ -4099,6 +4173,69 @@ class DMClientsApp:
             self.add_log("❌ Failed to start output reader")
 
     # ========== PROXY HELPERS ==========
+    def _decode_vmess_base64(self, key: str) -> str:
+        """Try to decode vmess://base64(json) into a standard vmess URI."""
+        if not key.startswith("vmess://"):
+            return key
+        payload = key[len("vmess://"):]
+        if not payload:
+            return key
+        try:
+            import base64
+            padded = payload + "=" * (-len(payload) % 4)
+            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+            obj = json.loads(decoded)
+            if not isinstance(obj, dict):
+                return key
+            add = obj.get("add", "")
+            port = obj.get("port", "")
+            uid = obj.get("id", "")
+            net = obj.get("net", "tcp")
+            ttype = obj.get("type", "none")
+            host = obj.get("host", "")
+            path = obj.get("path", "")
+            tls = obj.get("tls", "")
+            sni = obj.get("sni", "")
+            alpn = obj.get("alpn", "")
+            fp = obj.get("fp", "")
+            pbk = obj.get("pbk", "")
+            sid = obj.get("sid", "")
+            flow = obj.get("flow", "")
+            scy = obj.get("scy", "auto")
+
+            if not add or not port or not uid:
+                return key
+
+            params = [f"type={net}"]
+            if ttype and ttype != "none":
+                params.append(f"headerType={ttype}")
+            if host:
+                params.append(f"host={host}")
+            if path:
+                params.append(f"path={path}")
+            params.append(f"security={tls}" if tls else "security=none")
+            if sni:
+                params.append(f"sni={sni}")
+            if alpn:
+                params.append(f"alpn={alpn}")
+            if fp:
+                params.append(f"fp={fp}")
+            if pbk:
+                params.append(f"pbk={pbk}")
+            if sid:
+                params.append(f"sid={sid}")
+            if flow:
+                params.append(f"flow={flow}")
+            if scy and scy != "auto":
+                params.append(f"encryption={scy}")
+
+            query = "&".join(params)
+            remark = obj.get("ps", "")
+            fragment = f"#{remark}" if remark else ""
+            return f"vmess://{uid}@{add}:{port}?{query}{fragment}"
+        except Exception:
+            return key
+
     def _parse_key_to_config(self, key: str) -> dict | None:
         try:
             from python_v2ray.config_parser import parse_uri
@@ -4106,76 +4243,236 @@ class DMClientsApp:
             k = key
             if k.startswith("socks5://"):
                 k = "socks://" + k[len("socks5://"):]
+            elif k.startswith("shadowsocks://"):
+                k = "ss://" + k[len("shadowsocks://"):]
+            elif k.startswith("hy://"):
+                k = "hysteria://" + k[len("hy://"):]
+            elif k.startswith("hy2://"):
+                k = "hysteria2://" + k[len("hy2://"):]
 
-            parsed = parse_uri(k)
-            server = getattr(parsed, 'address', None) or getattr(parsed, 'server', None) or getattr(parsed, 'host', None)
+            if k.startswith("vmess://"):
+                k = self._decode_vmess_base64(k)
+
+            p = parse_uri(k)
+            server = getattr(p, 'address', None) or getattr(p, 'server', None) or getattr(p, 'host', None)
             if not server:
                 return None
 
-            if parsed.protocol in ('vless', 'vmess'):
-                outbound = {
-                    "protocol": parsed.protocol,
-                    "settings": {"vnext": [{"address": server, "port": parsed.port,
-                                            "users": [{"id": getattr(parsed, 'id', getattr(parsed, 'uuid', '')),
-                                                       "encryption": getattr(parsed, 'encryption', 'none'),
-                                                       "flow": getattr(parsed, 'flow', '')}]}]},
-                    "streamSettings": {"network": getattr(parsed, 'network', 'tcp'),
-                                       "security": getattr(parsed, 'security', 'none')}
+            # ---------- VLESS / VMESS ----------
+            if p.protocol in ('vless', 'vmess'):
+                ob = {
+                    "protocol": p.protocol,
+                    "settings": {"vnext": [{"address": server, "port": p.port,
+                        "users": [{"id": getattr(p, 'id', getattr(p, 'uuid', '')),
+                                   "encryption": getattr(p, 'encryption', 'none'),
+                                   "flow": getattr(p, 'flow', '')}]}]},
+                    "streamSettings": {"network": getattr(p, 'network', 'tcp'),
+                                       "security": getattr(p, 'security', 'none')}
                 }
-                sec = getattr(parsed, 'security', '')
-                if sec == 'reality':
-                    outbound['streamSettings']['realitySettings'] = {
-                        "serverName": getattr(parsed, 'sni', ''),
-                        "fingerprint": 'chrome',
-                        "publicKey": getattr(parsed, 'pbk', ''),
-                        "shortId": getattr(parsed, 'sid', ''),
-                        "spiderX": "/"
-                    }
-                elif sec == 'tls':
-                    outbound['streamSettings']['tlsSettings'] = {
-                        "serverName": getattr(parsed, 'sni', server),
-                        "allowInsecure": True
-                    }
-                return outbound
+                network = ob["streamSettings"]["network"]
+                security = ob["streamSettings"]["security"]
 
-            elif parsed.protocol in ('shadowsocks', 'ss'):
-                return {
+                if network == "ws":
+                    ws = {}
+                    if hasattr(p, "path"):
+                        ws["path"] = p.path
+                    if hasattr(p, "host"):
+                        ws["headers"] = {"Host": p.host}
+                    ob["streamSettings"]["wsSettings"] = ws
+                elif network == "grpc":
+                    grpc = {}
+                    if hasattr(p, "serviceName"):
+                        grpc["serviceName"] = p.serviceName
+                    if hasattr(p, "mode"):
+                        grpc["multiMode"] = p.mode == "multi"
+                    ob["streamSettings"]["grpcSettings"] = grpc
+                elif network == "http":
+                    http = {}
+                    if hasattr(p, "host"):
+                        http["host"] = [p.host] if isinstance(p.host, str) else p.host
+                    if hasattr(p, "path"):
+                        http["path"] = p.path
+                    ob["streamSettings"]["httpSettings"] = http
+                elif network == "kcp":
+                    kcp = {"congestion": True}
+                    if hasattr(p, "header"):
+                        kcp["header"] = {"type": p.header}
+                    elif hasattr(p, "headerType"):
+                        kcp["header"] = {"type": p.headerType}
+                    if hasattr(p, "seed"):
+                        kcp["seed"] = p.seed
+                    ob["streamSettings"]["kcpSettings"] = kcp
+                elif network == "quic":
+                    quic = {}
+                    if hasattr(p, "header"):
+                        quic["header"] = {"type": p.header}
+                    elif hasattr(p, "headerType"):
+                        quic["header"] = {"type": p.headerType}
+                    if hasattr(p, "quicSecurity"):
+                        quic["security"] = p.quicSecurity
+                    if hasattr(p, "key"):
+                        quic["key"] = p.key
+                    ob["streamSettings"]["quicSettings"] = quic
+
+                if security == "tls":
+                    tls_cfg = {"serverName": getattr(p, "sni", server),
+                               "allowInsecure": getattr(p, "allowInsecure", False)}
+                    if hasattr(p, "fingerprint"):
+                        tls_cfg["fingerprint"] = p.fingerprint
+                    if hasattr(p, "alpn"):
+                        alpn_val = p.alpn
+                        if isinstance(alpn_val, str):
+                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                        tls_cfg["alpn"] = alpn_val
+                    ob["streamSettings"]["tlsSettings"] = tls_cfg
+                elif security == "reality":
+                    reality_cfg = {
+                        "serverName": getattr(p, "sni", ""),
+                        "fingerprint": getattr(p, "fingerprint", "chrome"),
+                        "publicKey": getattr(p, "pbk", ""),
+                        "shortId": getattr(p, "sid", ""),
+                        "spiderX": getattr(p, "spiderX", "/")
+                    }
+                    if hasattr(p, "alpn"):
+                        alpn_val = p.alpn
+                        if isinstance(alpn_val, str):
+                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                        reality_cfg["alpn"] = alpn_val
+                    ob["streamSettings"]["realitySettings"] = reality_cfg
+                return ob
+
+            # ---------- Shadowsocks / SS ----------
+            if p.protocol in ('shadowsocks', 'ss'):
+                out = {
                     "protocol": "shadowsocks",
-                    "settings": {"servers": [{"address": server, "port": parsed.port,
-                                              "method": getattr(parsed, 'method', 'chacha20-ietf-poly1305'),
-                                              "password": getattr(parsed, 'password', '')}]}
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                        "method": getattr(p, 'method', 'chacha20-ietf-poly1305'),
+                        "password": getattr(p, 'password', '')}]}
                 }
+                if hasattr(p, "plugin"):
+                    out["settings"]["servers"][0]["plugin"] = p.plugin
+                    if hasattr(p, "pluginOpts"):
+                        out["settings"]["servers"][0]["pluginOpts"] = p.pluginOpts
+                ss_network = getattr(p, "network", None)
+                if ss_network and ss_network != "tcp":
+                    out["streamSettings"] = {"network": ss_network}
+                    if ss_network == "ws":
+                        ws = {}
+                        if hasattr(p, "path"):
+                            ws["path"] = p.path
+                        if hasattr(p, "host"):
+                            ws["headers"] = {"Host": p.host}
+                        out["streamSettings"]["wsSettings"] = ws
+                return out
 
-            elif parsed.protocol == 'trojan':
-                return {
+            # ---------- Trojan ----------
+            if p.protocol == 'trojan':
+                network = getattr(p, "network", "tcp")
+                security = getattr(p, "security", "tls")
+                out = {
                     "protocol": "trojan",
-                    "settings": {"servers": [{"address": server, "port": parsed.port,
-                                              "password": getattr(parsed, 'password', getattr(parsed, 'uuid', ''))}]},
-                    "streamSettings": {"security": "tls",
-                                       "tlsSettings": {"serverName": getattr(parsed, 'sni', server),
-                                                       "allowInsecure": True}}
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                        "password": getattr(p, 'password', getattr(p, 'uuid', ''))}]},
+                    "streamSettings": {"network": network, "security": security}
                 }
+                if security in ("tls", "reality"):
+                    if security == "tls":
+                        tls_cfg = {"serverName": getattr(p, "sni", server),
+                                   "allowInsecure": getattr(p, "allowInsecure", False)}
+                        if hasattr(p, "fingerprint"):
+                            tls_cfg["fingerprint"] = p.fingerprint
+                        if hasattr(p, "alpn"):
+                            alpn_val = p.alpn
+                            if isinstance(alpn_val, str):
+                                alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                            tls_cfg["alpn"] = alpn_val
+                        out["streamSettings"]["tlsSettings"] = tls_cfg
+                    elif security == "reality":
+                        out["streamSettings"]["realitySettings"] = {
+                            "serverName": getattr(p, "sni", ""),
+                            "fingerprint": getattr(p, "fingerprint", "chrome"),
+                            "publicKey": getattr(p, "pbk", ""),
+                            "shortId": getattr(p, "sid", ""),
+                            "spiderX": getattr(p, "spiderX", "/")
+                        }
+                if network == "ws":
+                    ws = {}
+                    if hasattr(p, "path"):
+                        ws["path"] = p.path
+                    if hasattr(p, "host"):
+                        ws["headers"] = {"Host": p.host}
+                    out["streamSettings"]["wsSettings"] = ws
+                elif network == "grpc":
+                    grpc = {}
+                    if hasattr(p, "serviceName"):
+                        grpc["serviceName"] = p.serviceName
+                    if hasattr(p, "mode"):
+                        grpc["multiMode"] = p.mode == "multi"
+                    out["streamSettings"]["grpcSettings"] = grpc
+                elif network == "kcp":
+                    kcp = {"congestion": True}
+                    if hasattr(p, "header"):
+                        kcp["header"] = {"type": p.header}
+                    elif hasattr(p, "headerType"):
+                        kcp["header"] = {"type": p.headerType}
+                    if hasattr(p, "seed"):
+                        kcp["seed"] = p.seed
+                    out["streamSettings"]["kcpSettings"] = kcp
+                return out
 
-            elif parsed.protocol in ('hysteria', 'hysteria2'):
-                return {
-                    "protocol": parsed.protocol,
-                    "settings": {"servers": [{"address": server, "port": parsed.port,
-                                              "password": getattr(parsed, 'password', getattr(parsed, 'auth', ''))}]},
-                    "streamSettings": {"network": "tcp", "security": "tls",
-                                       "tlsSettings": {"serverName": getattr(parsed, 'sni', server),
-                                                       "allowInsecure": True}}
+            # ---------- Hysteria / Hysteria2 ----------
+            if p.protocol in ('hysteria', 'hysteria2'):
+                out = {
+                    "protocol": p.protocol,
+                    "settings": {"servers": [{"address": server, "port": p.port,
+                        "password": getattr(p, 'password', getattr(p, 'auth', ''))}]},
+                    "streamSettings": {"network": "udp", "security": "tls",
+                        "tlsSettings": {"serverName": getattr(p, 'sni', server),
+                                        "allowInsecure": getattr(p, "allowInsecure", False)}}
                 }
+                if hasattr(p, "fingerprint"):
+                    out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fingerprint
+                if hasattr(p, "alpn"):
+                    alpn_val = p.alpn
+                    if isinstance(alpn_val, str):
+                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                    out["streamSettings"]["tlsSettings"]["alpn"] = alpn_val
 
-            elif parsed.protocol == 'socks':
-                user = getattr(parsed, 'id', '') or ''
-                pwd = getattr(parsed, 'password', '') or ''
-                srv = {"address": server, "port": parsed.port}
+                if p.protocol == "hysteria":
+                    if hasattr(p, "up"):
+                        out["settings"]["servers"][0]["up_mbps"] = p.up
+                    if hasattr(p, "down"):
+                        out["settings"]["servers"][0]["down_mbps"] = p.down
+                    if hasattr(p, "obfs"):
+                        out["settings"]["servers"][0]["obfs"] = p.obfs
+
+                if p.protocol == "hysteria2":
+                    if hasattr(p, "obfs"):
+                        out["settings"]["servers"][0]["obfs"] = {
+                            "type": getattr(p, "obfs", "salamander")
+                        }
+                        if hasattr(p, "obfs_password"):
+                            out["settings"]["servers"][0]["obfs"]["password"] = p.obfs_password
+                        elif hasattr(p, "obfsPassword"):
+                            out["settings"]["servers"][0]["obfs"]["password"] = p.obfsPassword
+                    if hasattr(p, "congestion_control_type"):
+                        out["settings"]["servers"][0]["congestion_control_type"] = p.congestion_control_type
+                    elif hasattr(p, "congestion"):
+                        out["settings"]["servers"][0]["congestion_control_type"] = p.congestion
+                    if hasattr(p, "up"):
+                        out["settings"]["servers"][0]["up_mbps"] = p.up
+                    if hasattr(p, "down"):
+                        out["settings"]["servers"][0]["down_mbps"] = p.down
+                return out
+
+            # ---------- SOCKS ----------
+            if p.protocol == 'socks':
+                user = getattr(p, 'id', '') or ''
+                pwd = getattr(p, 'password', '') or ''
+                srv = {"address": server, "port": p.port}
                 if user:
                     srv["users"] = [{"user": user, "pass": pwd}]
-                return {
-                    "protocol": "socks",
-                    "settings": {"servers": [srv]}
-                }
+                return {"protocol": "socks", "settings": {"servers": [srv]}}
         except Exception:
             return None
         return None
@@ -4530,7 +4827,7 @@ class DMClientsApp:
 
     def clear_logs(self):
         self._log_text.value = ""
-        self.page.update()
+        self._log_text.update()
         self.add_log("🧹 Logs cleared")
 
     def sync_clients(self, e=None):
@@ -4857,6 +5154,7 @@ class DMClientsApp:
 
 def main(page: ft.Page):
     app = DMClientsApp(page)
+    page.on_keyboard_event = app.on_keyboard
     def on_close(e):
         app.control_server.stop()
         app.client_manager.stop_all()

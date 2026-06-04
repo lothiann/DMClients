@@ -36,22 +36,105 @@ if sys.platform == 'win32':
         print("="*60)
         time.sleep(3)
 
+def _decode_vmess_base64(key: str) -> str:
+    """Try to decode vmess://base64(json) into a standard vmess URI
+    that python_v2ray can parse. Returns original key if decoding fails."""
+    if not key.startswith("vmess://"):
+        return key
+    payload = key[len("vmess://"):]
+    if not payload:
+        return key
+    try:
+        # Fix base64 padding + handle URL-safe variants
+        import base64
+        padded = payload + "=" * (-len(payload) % 4)
+        decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
+        obj = json.loads(decoded)
+        if not isinstance(obj, dict):
+            return key
+        # Reconstruct a standard vmess:// URI from the JSON fields
+        v = obj.get("v", "2")
+        add = obj.get("add", "")
+        port = obj.get("port", "")
+        uid = obj.get("id", "")
+        aid = obj.get("aid", 0)
+        net = obj.get("net", "tcp")
+        ttype = obj.get("type", "none")
+        host = obj.get("host", "")
+        path = obj.get("path", "")
+        tls = obj.get("tls", "")
+        sni = obj.get("sni", "")
+        alpn = obj.get("alpn", "")
+        fp = obj.get("fp", "")
+        pbk = obj.get("pbk", "")
+        sid = obj.get("sid", "")
+        flow = obj.get("flow", "")
+        scy = obj.get("scy", "auto")
+
+        if not add or not port or not uid:
+            return key
+
+        params = []
+        params.append(f"type={net}")
+        if ttype and ttype != "none":
+            params.append(f"headerType={ttype}")
+        if host:
+            params.append(f"host={host}")
+        if path:
+            params.append(f"path={path}")
+        if tls:
+            params.append(f"security={tls}")
+        else:
+            params.append("security=none")
+        if sni:
+            params.append(f"sni={sni}")
+        if alpn:
+            params.append(f"alpn={alpn}")
+        if fp:
+            params.append(f"fp={fp}")
+        if pbk:
+            params.append(f"pbk={pbk}")
+        if sid:
+            params.append(f"sid={sid}")
+        if flow:
+            params.append(f"flow={flow}")
+        if scy and scy != "auto":
+            params.append(f"encryption={scy}")
+
+        query = "&".join(params)
+        remark = obj.get("ps", "")
+        fragment = f"#{remark}" if remark else ""
+
+        return f"vmess://{uid}@{add}:{port}?{query}{fragment}"
+    except Exception:
+        return key
+
+
 def parse_key(key: str) -> dict | None:
     try:
         from python_v2ray.config_parser import parse_uri
 
         if key.startswith("socks5://"):
             key = "socks://" + key[len("socks5://"):]
+        elif key.startswith("shadowsocks://"):
+            key = "ss://" + key[len("shadowsocks://"):]
+        elif key.startswith("hy://"):
+            key = "hysteria://" + key[len("hy://"):]
+        elif key.startswith("hy2://"):
+            key = "hysteria2://" + key[len("hy2://"):]
+
+        # vmess://base64(json) — try decoding before parse_uri
+        if key.startswith("vmess://"):
+            key = _decode_vmess_base64(key)
 
         p = parse_uri(key)
-        if p is None:
-            return None
         server = getattr(p, "address", None) or getattr(p, "server", None) or getattr(p, "host", None)
         if not server:
             return None
 
+        # ---------- VLESS / VMESS ----------
         if p.protocol in ("vless", "vmess"):
-            ob = {
+            ob: dict = {
                 "protocol": p.protocol,
                 "settings": {"vnext": [{"address": server, "port": p.port,
                     "users": [{"id": getattr(p, "id", getattr(p, "uuid", "")),
@@ -60,39 +143,217 @@ def parse_key(key: str) -> dict | None:
                 "streamSettings": {"network": getattr(p, "network", "tcp"),
                                    "security": getattr(p, "security", "none")}
             }
-            sec = getattr(p, "security", "")
-            if sec == "reality":
-                ob["streamSettings"]["realitySettings"] = {
-                    "serverName": getattr(p, "sni", ""), "fingerprint": "chrome",
-                    "publicKey": getattr(p, "pbk", ""), "shortId": getattr(p, "sid", ""),
-                    "spiderX": "/"}
-            elif sec == "tls":
-                ob["streamSettings"]["tlsSettings"] = {
-                    "serverName": getattr(p, "sni", server), "allowInsecure": True}
+            network = ob["streamSettings"]["network"]
+            security = ob["streamSettings"]["security"]
+
+            # WebSocket
+            if network == "ws":
+                ws = {}
+                if hasattr(p, "path"):
+                    ws["path"] = p.path
+                if hasattr(p, "host"):
+                    ws["headers"] = {"Host": p.host}
+                ob["streamSettings"]["wsSettings"] = ws
+
+            # gRPC
+            elif network == "grpc":
+                grpc = {}
+                if hasattr(p, "serviceName"):
+                    grpc["serviceName"] = p.serviceName
+                if hasattr(p, "mode"):
+                    grpc["multiMode"] = p.mode == "multi"
+                ob["streamSettings"]["grpcSettings"] = grpc
+
+            # HTTP/2
+            elif network == "http":
+                http = {}
+                if hasattr(p, "host"):
+                    http["host"] = [p.host] if isinstance(p.host, str) else p.host
+                if hasattr(p, "path"):
+                    http["path"] = p.path
+                ob["streamSettings"]["httpSettings"] = http
+
+            # mKCP
+            elif network == "kcp":
+                kcp = {"congestion": True}
+                if hasattr(p, "header"):
+                    kcp["header"] = {"type": p.header}
+                elif hasattr(p, "headerType"):
+                    kcp["header"] = {"type": p.headerType}
+                if hasattr(p, "seed"):
+                    kcp["seed"] = p.seed
+                ob["streamSettings"]["kcpSettings"] = kcp
+
+            # QUIC
+            elif network == "quic":
+                quic = {}
+                if hasattr(p, "header"):
+                    quic["header"] = {"type": p.header}
+                elif hasattr(p, "headerType"):
+                    quic["header"] = {"type": p.headerType}
+                if hasattr(p, "quicSecurity"):
+                    quic["security"] = p.quicSecurity
+                if hasattr(p, "key"):
+                    quic["key"] = p.key
+                ob["streamSettings"]["quicSettings"] = quic
+
+            # TLS / Reality
+            if security == "tls":
+                tls_cfg = {
+                    "serverName": getattr(p, "sni", server),
+                    "allowInsecure": getattr(p, "allowInsecure", False)
+                }
+                if hasattr(p, "fingerprint"):
+                    tls_cfg["fingerprint"] = p.fingerprint
+                if hasattr(p, "alpn"):
+                    alpn_val = p.alpn
+                    if isinstance(alpn_val, str):
+                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                    tls_cfg["alpn"] = alpn_val
+                ob["streamSettings"]["tlsSettings"] = tls_cfg
+            elif security == "reality":
+                reality_cfg = {
+                    "serverName": getattr(p, "sni", ""),
+                    "fingerprint": getattr(p, "fingerprint", "chrome"),
+                    "publicKey": getattr(p, "pbk", ""),
+                    "shortId": getattr(p, "sid", ""),
+                    "spiderX": getattr(p, "spiderX", "/")
+                }
+                if hasattr(p, "alpn"):
+                    alpn_val = p.alpn
+                    if isinstance(alpn_val, str):
+                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                    reality_cfg["alpn"] = alpn_val
+                ob["streamSettings"]["realitySettings"] = reality_cfg
             return ob
 
+        # ---------- Shadowsocks / SS ----------
         if p.protocol in ("shadowsocks", "ss"):
-            return {"protocol": "shadowsocks",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "method": getattr(p, "method", "chacha20-ietf-poly1305"),
-                        "password": getattr(p, "password", "")}]}}
+            out = {
+                "protocol": "shadowsocks",
+                "settings": {"servers": [{"address": server, "port": p.port,
+                    "method": getattr(p, "method", "chacha20-ietf-poly1305"),
+                    "password": getattr(p, "password", "")}]}
+            }
+            if hasattr(p, "plugin"):
+                out["settings"]["servers"][0]["plugin"] = p.plugin
+                if hasattr(p, "pluginOpts"):
+                    out["settings"]["servers"][0]["pluginOpts"] = p.pluginOpts
+            ss_network = getattr(p, "network", None)
+            if ss_network and ss_network != "tcp":
+                out["streamSettings"] = {"network": ss_network}
+                if ss_network == "ws":
+                    ws = {}
+                    if hasattr(p, "path"):
+                        ws["path"] = p.path
+                    if hasattr(p, "host"):
+                        ws["headers"] = {"Host": p.host}
+                    out["streamSettings"]["wsSettings"] = ws
+            return out
 
+        # ---------- Trojan ----------
         if p.protocol == "trojan":
-            return {"protocol": "trojan",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "password": getattr(p, "password", getattr(p, "uuid", ""))}]},
-                    "streamSettings": {"security": "tls",
-                        "tlsSettings": {"serverName": getattr(p, "sni", server),
-                                        "allowInsecure": True}}}
+            network = getattr(p, "network", "tcp")
+            security = getattr(p, "security", "tls")
+            out = {
+                "protocol": "trojan",
+                "settings": {"servers": [{"address": server, "port": p.port,
+                    "password": getattr(p, "password", getattr(p, "uuid", ""))}]},
+                "streamSettings": {"network": network, "security": security}
+            }
+            if security in ("tls", "reality"):
+                if security == "tls":
+                    tls_cfg = {
+                        "serverName": getattr(p, "sni", server),
+                        "allowInsecure": getattr(p, "allowInsecure", False)
+                    }
+                    if hasattr(p, "fingerprint"):
+                        tls_cfg["fingerprint"] = p.fingerprint
+                    if hasattr(p, "alpn"):
+                        alpn_val = p.alpn
+                        if isinstance(alpn_val, str):
+                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                        tls_cfg["alpn"] = alpn_val
+                    out["streamSettings"]["tlsSettings"] = tls_cfg
+                elif security == "reality":
+                    out["streamSettings"]["realitySettings"] = {
+                        "serverName": getattr(p, "sni", ""),
+                        "fingerprint": getattr(p, "fingerprint", "chrome"),
+                        "publicKey": getattr(p, "pbk", ""),
+                        "shortId": getattr(p, "sid", ""),
+                        "spiderX": getattr(p, "spiderX", "/")
+                    }
+            if network == "ws":
+                ws = {}
+                if hasattr(p, "path"):
+                    ws["path"] = p.path
+                if hasattr(p, "host"):
+                    ws["headers"] = {"Host": p.host}
+                out["streamSettings"]["wsSettings"] = ws
+            elif network == "grpc":
+                grpc = {}
+                if hasattr(p, "serviceName"):
+                    grpc["serviceName"] = p.serviceName
+                if hasattr(p, "mode"):
+                    grpc["multiMode"] = p.mode == "multi"
+                out["streamSettings"]["grpcSettings"] = grpc
+            elif network == "kcp":
+                kcp = {"congestion": True}
+                if hasattr(p, "header"):
+                    kcp["header"] = {"type": p.header}
+                elif hasattr(p, "headerType"):
+                    kcp["header"] = {"type": p.headerType}
+                if hasattr(p, "seed"):
+                    kcp["seed"] = p.seed
+                out["streamSettings"]["kcpSettings"] = kcp
+            return out
 
+        # ---------- Hysteria / Hysteria2 ----------
         if p.protocol in ("hysteria", "hysteria2"):
-            return {"protocol": p.protocol,
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "password": getattr(p, "password", getattr(p, "auth", ""))}]},
-                    "streamSettings": {"network": "tcp", "security": "tls",
-                        "tlsSettings": {"serverName": getattr(p, "sni", server),
-                                        "allowInsecure": True}}}
+            out = {
+                "protocol": p.protocol,
+                "settings": {"servers": [{"address": server, "port": p.port,
+                    "password": getattr(p, "password", getattr(p, "auth", ""))}]},
+                "streamSettings": {"network": "udp", "security": "tls",
+                    "tlsSettings": {"serverName": getattr(p, "sni", server),
+                                    "allowInsecure": getattr(p, "allowInsecure", False)}}
+            }
+            if hasattr(p, "fingerprint"):
+                out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fingerprint
+            if hasattr(p, "alpn"):
+                alpn_val = p.alpn
+                if isinstance(alpn_val, str):
+                    alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
+                out["streamSettings"]["tlsSettings"]["alpn"] = alpn_val
 
+            if p.protocol == "hysteria":
+                if hasattr(p, "up"):
+                    out["settings"]["servers"][0]["up_mbps"] = p.up
+                if hasattr(p, "down"):
+                    out["settings"]["servers"][0]["down_mbps"] = p.down
+                if hasattr(p, "obfs"):
+                    out["settings"]["servers"][0]["obfs"] = p.obfs
+
+            if p.protocol == "hysteria2":
+                if hasattr(p, "obfs"):
+                    out["settings"]["servers"][0]["obfs"] = {
+                        "type": getattr(p, "obfs", "salamander")
+                    }
+                    if hasattr(p, "obfs_password"):
+                        out["settings"]["servers"][0]["obfs"]["password"] = p.obfs_password
+                    elif hasattr(p, "obfsPassword"):
+                        out["settings"]["servers"][0]["obfs"]["password"] = p.obfsPassword
+                if hasattr(p, "congestion_control_type"):
+                    out["settings"]["servers"][0]["congestion_control_type"] = p.congestion_control_type
+                elif hasattr(p, "congestion"):
+                    out["settings"]["servers"][0]["congestion_control_type"] = p.congestion
+                if hasattr(p, "up"):
+                    out["settings"]["servers"][0]["up_mbps"] = p.up
+                if hasattr(p, "down"):
+                    out["settings"]["servers"][0]["down_mbps"] = p.down
+            return out
+
+        # ---------- SOCKS ----------
         if p.protocol == "socks":
             users = []
             user = getattr(p, "id", "")
@@ -102,12 +363,10 @@ def parse_key(key: str) -> dict | None:
             return {"protocol": "socks",
                     "settings": {"servers": [{"address": server, "port": p.port,
                                                "users": users}]}}
-
-        print(f"⚠️ Unsupported protocol: {p.protocol}")
-        return None
     except Exception as e:
-        print(f"⚠️ Parse error: {e}")
-        return None
+        print(f"Parse error: {e}")
+        pass
+    return None
 
 
 def start_proxy(proxy_config):
