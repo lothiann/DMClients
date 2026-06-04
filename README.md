@@ -483,16 +483,68 @@ The utility can also automatically select the best proxies for you. ([Settings](
 
 ## Frequently Asked Questions (FAQ)
 
-**Q: ProxiFyre starts with logs beginning with `? ....`**  
-A: Download and install the driver:  
+**Q1: When starting the proxy, the log `⚠️ WARNING: ndisrd.sys driver not found!" is displayed.` **
+**Q2: Proxy selection doesn't work / Few bots come in**
+A: Download and install the driver:
 https://github.com/wiresock/ndisapi/releases
 
-**Q: Proxies are not being selected / Finds very few proxies**  
-A1: Try disabling all utilities that affect the network.  
-A2: Open `optimal_proxies_new.py` in a text editor and increase the value of `GAME_BASE_TIMEOUT`.
+**Q: Where can I get player IDs?**
+A1: In the "Tab" tab, find the "ID" column in the table
+A2: In the DDNet client, go to Settings -> HUD -> Show Client ID
 
-**Q: Proxies are selected in a very short time / Errors during selection**  
-A: Make sure you extracted the archive and that `xray.exe` is in the same folder as the scripts.
+**Q: Proxy subscriptions are not downloaded during proxy testing/proxy pings are not possible**
+A1: Make sure you are not blocked by your provider
+A2: Enable the DPI bypass tool
+
+**Q: When will there be a DDNet client?**
+A: In plans
+
+**Q: How can I create my own function?**
+A: Use [Code Execute](#code-execute)
+
+**Q: Where can I get commands?**
+A: ddnet.org/settingscommands/#client-commands
+
+**Q: When sending a command, the log "⚠️ No online clients selected" appears.**
+A1: Make sure the clients are connected and selected in the "Clients" tab
+A2: Otherwise, restart the UI and terminate all "HDDNet*.exe" processes
+
+**Q: How can I insert my proxies into the current ones?**
+A: In the /Settings/proxies.json file, paste your proxies in the following json format:
+```Json
+[
+  {
+    "port": 10801,
+    "key": "YOUR_KEY_1"
+  },
+  {
+    "port": 10802,
+    "key": "YOUR_KEY_2"
+  },
+  {
+    "port": 10803,
+    "key": "YOUR_KEY_3"
+  },
+  {
+    "port": 10804,
+    "key": "YOUR_KEY_4"
+  },
+  ...
+]
+```
+
+**Q: How can I insert my proxies/proxy subcription into the proxy selection?**
+A: In the /Settings/subscriptions.json file, paste your proxies in the following json format:
+```Json
+[
+  "http://...",
+  "https://...",
+  "vless://...",
+  "YOUR_KEY_1",
+  "YOUR_KEY_2",
+  "YOUR_KEY_3"
+]
+```
 
 ---
 
