@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 _global_names = []
 _global_dictionary = []
 _show_advanced_logs = False
+_VERSION = "v8fix"
 
 _main_loop: asyncio.AbstractEventLoop | None = None
 
@@ -949,10 +950,10 @@ class HDDNetClientManager:
         result = {'pid': pid, 'control_port': None, 'bridge_port': None}
         try:
             proc = psutil.Process(pid)
-            for conn in proc.net_connections(kind='tcp'):          # только TCP
+            for conn in proc.net_connections(kind='tcp'):
                 if conn.status != 'ESTABLISHED' or not conn.raddr:
                     continue
-                if conn.raddr.port == 5555 and result['control_port'] is None:   # берём первое, не перезаписываем
+                if conn.raddr.port == 5555 and result['control_port'] is None:
                     result['control_port'] = conn.laddr.port
                 elif conn.raddr.port == 5556 and result['bridge_port'] is None:
                     result['bridge_port'] = conn.laddr.port
@@ -2057,6 +2058,7 @@ class DMClientsApp:
         self._start_monitoring()
         self.page.run_task(self.monitor_loop)
         self.page.run_task(self.players_tab_loop)
+        self.check_for_updates()
 
         psutil.Process(os.getpid()).nice(psutil.REALTIME_PRIORITY_CLASS)
         for c in psutil.Process(os.getpid()).children():
@@ -2213,6 +2215,68 @@ class DMClientsApp:
                     self.add_log(f"🔗 Synced: Client #{client_id} → Control #{cid} ↔ Bridge #{bridge_cidx}")
 
         return synced
+
+    def check_for_updates(self):
+        import requests
+        from packaging import version
+    
+        def normalize_tag(tag):
+            tag = tag.lower().lstrip('v')
+
+            if 'fix' in tag:
+                fix_match = re.search(r'(\d+)fix(\d*)', tag)
+                if fix_match:
+                    base = fix_match.group(1)
+                    fix_num = fix_match.group(2) if fix_match.group(2) else '1'
+                    return f"{base}.{fix_num}"
+                return tag.replace('fix', '.1')
+
+            if 'alpha' in tag:
+                return tag.replace('alpha', 'a0')
+            elif 'prebeta' in tag:
+                return tag.replace('prebeta', 'b0')
+            elif 'beta' in tag:
+                return tag.replace('beta', 'b1')
+            else:
+                return tag
+    
+        def do_check():
+            try:
+                url = "https://api.github.com/repos/lothiann/DMClients/releases/latest"
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                data = response.json()
+            
+                latest_tag = data['tag_name']
+                current_tag = _VERSION
+            
+                current_norm = normalize_tag(current_tag)
+                latest_norm = normalize_tag(latest_tag)
+            
+                if version.parse(latest_norm) > version.parse(current_norm):
+                    release_url = data['html_url']
+                    msg = f"⚠️ New version detected ({current_tag} < {latest_tag}): {release_url}"
+                
+                    self.add_log(msg)
+                
+                    if hasattr(self, 'page'):
+                        self.page.show_snack_bar(
+                            ft.SnackBar(
+                                content=ft.Text(f"New version {latest_tag} available!", size=14),
+                                action="Open",
+                                on_action=lambda e: self.page.launch_url(release_url),
+                                duration=10000,
+                            )
+                        )
+                else:
+                    if _show_advanced_logs:
+                        self.add_log(f"✅ Already on latest version ({current_tag})")
+                    
+            except Exception as e:
+                if _show_advanced_logs:
+                    self.add_log(f"⚠️ Version check failed: {e}")
+    
+        threading.Thread(target=do_check, daemon=True).start()
 
     def _start_monitoring(self):
         pass  # The old threaded monitor_loop has been removed to avoid race conditions.
@@ -3066,9 +3130,9 @@ class DMClientsApp:
                 content=ft.Row([self.cron_command, self.cron_delay, self.cron_switch], spacing=10),
                 padding=10,
                 bgcolor="#1a1a24",
-                border_radius=10,
-                margin=ft.Margin.only(bottom=10)
+                border_radius=10
             ),
+            ft.Text("Commands documentation: ", selectable=True, spans=[ft.TextSpan("https://ddnet.org/settingscommands/#client-commands", url="https://ddnet.org/settingscommands/#client-commands", style=ft.TextStyle(color="#A855F7", size=14))], margin=ft.Margin.only(bottom=10)),
             ft.Text("Input controls", size=16, weight="bold", tooltip="Manual bot input: movement, weapon, kill, copy moves"),
             ft.Container(
                 content=ft.Column([
@@ -3323,6 +3387,7 @@ class DMClientsApp:
                 proxy_settings,
                 ft.Text("Github: ", selectable=True, spans=[ft.TextSpan("https://github.com/lothiann/DMClients", url="https://github.com/lothiann/DMClients", style=ft.TextStyle(color="#A855F7", size=14))]),
                 ft.Text("Telegram: ", selectable=True, spans=[ft.TextSpan("https://t.me/DMClients", url="https://t.me/DMClients", style=ft.TextStyle(color="#A855F7", size=14))]),
+                ft.Text(f"Version: {_VERSION}", selectable=True),
             ], spacing=10, scroll=ft.ScrollMode.AUTO),
             padding=20, expand=True,
             alignment=ft.Alignment(-1, -1),
@@ -3411,7 +3476,6 @@ class DMClientsApp:
             pass
 
     def on_keyboard(self, e: ft.KeyboardEvent):
-        """Handle arrow keys for command history navigation."""
         if not self.console_container.visible:
             return
 
@@ -4174,7 +4238,6 @@ class DMClientsApp:
 
     # ========== PROXY HELPERS ==========
     def _decode_vmess_base64(self, key: str) -> str:
-        """Try to decode vmess://base64(json) into a standard vmess URI."""
         if not key.startswith("vmess://"):
             return key
         payload = key[len("vmess://"):]

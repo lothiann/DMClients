@@ -1046,7 +1046,7 @@ def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_
                     console.print("    [yellow]⏰ Map loading...[/yellow]")
 
                 low = line.lower()
-                if any(x in low for x in ("entering game", "map loaded", "welcome", "got pong from current server")):
+                if any(x in low for x in ("entering game", "map loaded", "welcome", "got pong from current server", "i motd", "chat/server")):
                     console.print("    [green]✅ Connected[/green]")
                     return True
 
