@@ -8,26 +8,25 @@
 
 ## Table of Contents
 - [Overview](#overview)
-- [Navigation](#️functions)
-  - **Tabs:**
-    - [Console](#console)
-    - [Clients](#clients)
-    - [Actions](#actions)
-      - [Player / Dummy settings](#player--dummy-settings)
-      - [Server connection](#server-connection)
-      - [Callvote](#callvote)
-      - [Say / Spam](#say--spam)
-      - [Input controls](#input-controls)
-      - [Aim](#aim)
-      - [Block](#block)
-      - [Pathfinder](#pathfinder-experimental)
-      - [Macros & Rules](#macros--rules)
-      - [Code Execute](#code-execute)
-    - [Tab](#tab)
-    - [Servers](#servers)
-      - [Server Hop](#server-hop)
-    - [Settings](#settings)
-- [Custom Commands](#️custom-commands)
+- [Functions](#functions)
+  - [Console](#console)
+  - [Clients](#clients)
+  - [Actions](#actions)
+    - [Player / Dummy settings](#player--dummy-settings)
+    - [Server connection](#server-connection)
+    - [Callvote](#callvote)
+    - [Say / Spam](#say--spam)
+    - [Input controls](#input-controls)
+    - [Aim](#aim)
+    - [Block](#block)
+    - [Pathfinder (Experimental)](#pathfinder-experimental)
+    - [Macros & Rules](#macros--rules)
+    - [Code Execute](#code-execute)
+  - [Tab](#tab)
+  - [Servers](#servers)
+    - [Server Hop](#server-hop)
+  - [Settings](#settings)
+- [Custom Commands](#custom-commands)
 - [Placeholders](#placeholders)
 - [Files](#files)
 - [Bypassing Bans](#bypassing-bans)
@@ -63,6 +62,7 @@ The main command terminal. Here you can type any command and send it to all **se
 - The log area above shows all events, errors, and responses from the app
 - Logs auto-scroll to the bottom; scrolling up pauses auto-scroll
 - Up to **2000 lines** are kept in the log buffer
+- Logs are **batched and flushed every 100 ms** to avoid UI freezes under heavy load (e.g. when hundreds of lines arrive per second during proxy testing)
 
 ---
 
@@ -352,21 +352,30 @@ Automatically cycles through servers at a set interval.
 ### Settings
 
 #### Quick actions
+Buttons are split across two rows.
+
+**Row 1 — proxy buttons + clear logs:**
+
 | Button | Description |
 |--------|-------------|
-| Optimal Proxies | Runs `optimal_proxies_new.py` to find the best proxies for your setup |
-| Fast Proxies | Downloads `fastproxies.json` from GitHub, tests each key via HTTP + DNS through a temporary Xray instance, picks the best N and saves to `Settings/proxies.json` |
-| Start Proxies | Starts `ports_proxies.py` + `ProxiFyre.exe` — stops them if already running |
-| Start / Stop all clients | Launches or stops all client instances with a small delay between each |
-| Clear logs | Clears the console log |
-| Sync clients | Sends `c_sync` to selected clients |
+| Optimal Proxies | Runs `optimal_proxies.py` — fetches subscriptions, dedupes, runs TCP/TLS/UDP prefilter, then in-game validation against a random target server. Saves the best **Proxy limit** keys to `Settings/proxies.json` (the pool). |
+| Fast proxies | Downloads `fastproxies.json` from GitHub, tests each key via HTTP + DNS through a temporary Xray instance, picks the best **Proxy limit** keys and saves them to `Settings/proxies.json` (the pool). |
+| Check Proxy | Tests every key in `Settings/proxies.json` via HTTP-through-SOCKS5, sorts by ping, saves the best `ceil(Clients / Clients per proxy)` keys as a plain array to `Settings/checked_proxies.json`. **Start Proxies reads from this file**, so this button must be pressed before launching proxies. |
+| Start Proxies | Starts `ports_proxies.py` — reads `Settings/checked_proxies.json` and launches local Xray SOCKS5 tunnels (one per key on sequential ports starting from 10801). Toggles to Stop if already running. |
+| Clear logs | Clears the console log. |
+
+**Row 2 — clients + sync:**
+
+| Button | Description |
+|--------|-------------|
+| Start / Stop all clients | Launches (or stops) all client instances with a small delay between each. The button state reflects the actual running count: if any client is not running it shows **Start**, otherwise **Stop**. |
+| Sync clients | Sends `c_sync` to selected clients. |
 
 #### Options
 | Option | Description |
 |--------|-------------|
 | Adding ";" in commands | Wraps every command as `; <cmd>;` before sending |
 | Show Proxy logs | Show output of `ports_proxies.py` in console |
-| Show ProxiFyre logs | Show output of `ProxiFyre.exe` in console |
 | Advanced logs | Show low-level sync and token messages |
 | Try to fix player loading | Sends a series of `zoom-` commands to force client to reload player list |
 | Timeout reconnect | Toggles fast reconnect (`conn_timeout 5; cl_reconnect_timeout 1`) |
@@ -375,10 +384,19 @@ Automatically cycles through servers at a set interval.
 #### Client count
 - **Clients** — total number of client instances (`HDDNet1.exe` … `HDDNetN.exe`)
 - **Clients per proxy** — how many clients share one proxy
-- **Apply** — copies `HDDNet1.exe` for the new count, regenerates `ProxiFyre/app-config.json`
+- **Proxy limit** — how many keys to keep in the `proxies.json` pool (used as `--top-n=` for Optimal/Fast proxies)
+- **Apply** — copies `HDDNet1.exe` for the new count; persists `num_clients` / `clients_per_proxy` / `proxy_limit` to `Settings/proxies.json` under the `settings` block
+
+#### Proxy testing options
+- **Use spare proxies** + **Spare count** — also pick `Spare count` extra working keys into `Settings/spare_proxies.json` after the main run
+- **Target servers** — comma-separated list of DDNet servers (e.g. `1.2.3.4:8305,5.6.7.8:8305`). A random one is picked **before each `connect` attempt** in the in-game validation step, so different proxies are tested against different servers.
+- **Timeout (ms)** — TCP/TLS/UDP/IP-check timeout for `optimal_proxies.py`
+- **Threads** — `MAX_WORKERS` for `optimal_proxies.py`
+- **Test in DDNet** — when ON, validates every candidate proxy by actually connecting to a DDNet server through it. When OFF, picks the top **Proxy limit** keys by ping only (much faster but less reliable).
+- **Banned Filter** — when ON, proxies whose exit IP is in `Settings/bproxies.json` are **skipped** during selection. When OFF, banned IPs are still **recorded** (so the list keeps growing) but not filtered out — useful for servers without IP-based protection. Passed via `--banned-filter=true|false`.
 
 #### Proxies table
-Shows all entries from `Settings/proxies.json`. Each row displays the port and a preview of the proxy key, with a **Replace** button that pops the next key from `Settings/spare_proxies.json`.
+Shows all keys currently in `Settings/proxies.json` (the pool). Each row displays the port (10801 + index), a preview of the key, a **Replace** button that pops the next key from `Settings/spare_proxies.json`, and a **Ping** column populated by Check Proxy / Ping.
 
 ---
 
@@ -419,6 +437,7 @@ Commands sent through the Control Server to clients:
 | `c_macro_save "<path>"` | Save the current recorded macro |
 | `c_macro_capture <id>` | Set capture ID before recording |
 | `c_sync` | Force client to resync state |
+| `c_proxy <0/1> [host:port]` | Route this client's traffic through the given SOCKS5 proxy (or drop it when `0`) |
 
 ---
 
@@ -445,19 +464,18 @@ Project file/folder structure:
 |------|-------------|
 | `UI.py/.exe` | Main application — Flet GUI, Control/Bridge servers, client management, all tabs and actions |
 | `compile.py` | PyInstaller build script — patches scripts for frozen exe mode, generates `.spec`, compiles all scripts into a single `Out/DMClients/` folder |
-| `optimal_proxies_new.py/.exe` | Proxy tester — fetches subscriptions, deduplicates, TCP/TLS/UDP prefilter, Xray connectivity test, DDNet visual test, outputs `proxies.json` |
-| `ports_proxies.py/.exe` | Proxy starter — reads `proxies.json`, launches local Xray SOCKS5 tunnels (one per proxy key on sequential ports starting from 10801) |
-| `xray.exe` | Xray-core binary — handles VLESS/Shadowsocks/Trojan/VMess proxy connections |
-| `DDNets-19.9-win64/` | DDNet client binaries — contains `HDDNet1.exe`, `HDDNet2.exe`, etc. (renamed DDNet builds with Bridge DLL injected) |
-| `ProxiFyre/` | ProxiFyre — WinSock NDIS driver-based traffic router that redirects DDNet client traffic through local SOCKS5 proxies; contains `ProxiFyre.exe` and `app-config.json` |
+| `optimal_proxies.py/.exe` | Proxy tester — fetches subscriptions, deduplicates, TCP/TLS/UDP prefilter, Xray connectivity test, in-game validation against a random target server. Outputs `Settings/proxies.json` (the pool). |
+| `ports_proxies.py/.exe` | Proxy starter — reads `Settings/checked_proxies.json`, launches local Xray SOCKS5 tunnels (one per proxy key on sequential ports starting from 10801) |
+| `xray.exe` | Xray-core binary — handles VLESS/Shadowsocks/Trojan/VMess/Hysteria/Hysteria2/WireGuard proxy connections |
+| `DDNet-19.9-win64/` | DDNet client binaries — contains `HDDNet1.exe`, `HDDNet2.exe`, etc. (renamed DDNet builds with Bridge DLL injected) |
 | `Settings/` | Configuration storage |
-| `Settings/config.json` | UI state persistence — saves/loads all field values, checkboxes, sliders, etc. across sessions |
-| `Settings/proxies.json` | Active proxy keys — v2ray keys (VLESS/SS/Trojan) used by `ports_proxies.py` to create Xray tunnels |
-| `Settings/spare_proxies.json` | Spare proxy keys — pool of extra keys; the UI "Replace" button pops keys from here into `proxies.json` |
+| `Settings/proxies.json` | **Pool** of proxy keys (output of Optimal/Fast proxies). Format: `{"settings": {...}, "proxies": ["key1", "key2", ...]}` — the `settings` block stores `num_clients`, `clients_per_proxy`, `proxy_limit` |
+| `Settings/checked_proxies.json` | **Selected** proxies (output of Check Proxy). Plain array of key strings, e.g. `["vless://...", "vmess://..."]`. Read by `ports_proxies.py` at startup. |
+| `Settings/spare_proxies.json` | Spare proxy keys — plain array of strings; the UI "Replace" button pops keys from here into `proxies.json` |
+| `Settings/bproxies.json` | Banned exit IPs — populated automatically when a proxy gets banned in-game; filtered out by Optimal Proxies when **Banned Filter** is ON |
+| `Settings/subscriptions.json` | List of subscription URLs / direct keys consumed by Optimal Proxies |
 | `Settings/names.json` | Name list — random names picked by the `{n}` placeholder |
 | `Settings/dictionary.json` | Dictionary list — random words picked by the `{d}` placeholder |
-| `Settings/fastproxies.json` | Cached fast proxies — downloaded from GitHub by the "Fast Proxies" button |
-| `Settings/bproxies.json` | Ban list — proxy keys that failed or were blacklisted during testing |
 | `Macros/` | Macro storage — `.inp` (recorded input) and `.rule` (Python script) files for the Macros & Rules system |
 | `Scripts/` | Script storage — `.py` / `.txt` files loadable by the Code Execute tab |
 | `Temp/` | Temporary files — working directory for proxy testing, intermediate Xray configs, etc. |
@@ -469,30 +487,54 @@ Project file/folder structure:
 
 DMClients supports proxies to bypass IP bans and per-IP connection limits.
 
-Each group of clients (configured via **Clients per proxy**) is routed through its own SOCKS5 proxy on a local port (`10801`, `10802`, …). The proxy configuration is auto-generated at `ProxiFyre/app-config.json`.
-The utility can also automatically select the best proxies for you. ([Settings](#settings))
+Each group of clients (configured via **Clients per proxy**) is routed through its own SOCKS5 proxy on a local port (`10801`, `10802`, …). The DDNet client receives a `c_proxy 1 127.0.0.1:<port>` command that pushes all of its traffic through the corresponding Xray tunnel — no system-level traffic interception is needed.
 
-**You can select them manually.**
+### Proxy pipeline
+
+```
+   Optimal Proxies / Fast proxies
+                 │
+                 ▼
+       Settings/proxies.json      ← pool of Proxy limit keys
+                 │
+                 ▼  Check Proxy (HTTP ping + sort by latency)
+       Settings/checked_proxies.json   ← best ceil(Clients/CPP) keys
+                 │
+                 ▼  Start Proxies
+       ports_proxies.py  →  Xray SOCKS5 tunnels on 10801, 10802, …
+                 │
+                 ▼  c_proxy 1 127.0.0.1:<port>  (broadcast to clients)
+            DDNet clients
+```
+
+- **Optimal Proxies / Fast proxies** — populate `proxies.json` (the pool, size = **Proxy limit**).
+- **Check Proxy** — tests every key in the pool, picks the best `ceil(Clients / Clients per proxy)` keys, writes them to `checked_proxies.json` (a plain array of strings).
+- **Start Proxies** — reads `checked_proxies.json` and starts one Xray SOCKS5 tunnel per key. Exits with an error if the file is missing or empty (run **Check Proxy** first).
+- Each DDNet client is mapped to a port via `10801 + ((client_id − 1) // Clients per proxy)`.
+
+**You can also select proxies manually:**
 1. Get v2ray proxy keys (VLESS, Shadowsocks, Trojan, etc.)
-2. Place them in `Settings/proxies.json`
-3. Click **Start Proxies** — this starts `ports_proxies.py` (Xray tunnels) and `ProxiFyre.exe` (traffic routing)
+2. Place them as a plain array in `Settings/checked_proxies.json`:
+   ```json
+   [
+     "vless://uuid@1.2.3.4:443?...",
+     "vmess://eyJ...",
+     "trojan://password@5.6.7.8:443?..."
+   ]
+   ```
+3. Click **Start Proxies** — Xray tunnels come up on ports 10801, 10802, …
 
-> **Note:** ProxiFyre requires the WinSock NDIS API driver. See [FAQ](#-frequently-asked-questions-faq) if it starts with `? ...` errors.
+> After Optimal Proxies finishes the in-game validation step, the bot sends a `disconnect` command and waits 0.5 s before killing the DDNet process — this prevents false "vpn detected" / "disconnected" logs when rapidly switching between proxies.
 
 ---
 
 ## Frequently Asked Questions (FAQ)
 
-**Q1: When starting the proxy, the log `⚠️ WARNING: ndisrd.sys driver not found!" is displayed.` **
-**Q2: Proxy selection doesn't work / Few bots come in**
-A: Download and install the driver:
-https://github.com/wiresock/ndisapi/releases
-
 **Q: Where can I get player IDs?**
 A1: In the "Tab" tab, find the "ID" column in the table
 A2: In the DDNet client, go to Settings -> HUD -> Show Client ID
 
-**Q: Proxy subscriptions are not downloaded during proxy testing/proxy pings are not possible**
+**Q: Proxy subscriptions are not downloaded during proxy testing / proxy pings are not possible**
 A1: Make sure you are not blocked by your provider
 A2: Enable the DPI bypass tool
 
@@ -509,42 +551,35 @@ A: ddnet.org/settingscommands/#client-commands
 A1: Make sure the clients are connected and selected in the "Clients" tab
 A2: Otherwise, restart the UI and terminate all "HDDNet*.exe" processes
 
-**Q: How can I insert my proxies into the current ones?**
-A: In the /Settings/proxies.json file, paste your proxies in the following json format:
-```Json
+**Q: Start Proxies exits with `ERROR: checked_proxies.json not found`**
+A: **Check Proxy** must be pressed at least once before **Start Proxies**. It tests every key in `proxies.json` and writes the best ones to `checked_proxies.json` (which `ports_proxies.py` reads at startup).
+
+**Q: How can I insert my own proxies manually?**
+A: Place them as a plain array of v2ray key strings in `Settings/checked_proxies.json`:
+```json
 [
-  {
-    "port": 10801,
-    "key": "YOUR_KEY_1"
-  },
-  {
-    "port": 10802,
-    "key": "YOUR_KEY_2"
-  },
-  {
-    "port": 10803,
-    "key": "YOUR_KEY_3"
-  },
-  {
-    "port": 10804,
-    "key": "YOUR_KEY_4"
-  },
-  ...
+  "vless://uuid@1.2.3.4:443?security=reality&...",
+  "vmess://eyJ2Ijoi...",
+  "trojan://password@5.6.7.8:443?sni=...",
+  "ss://YWVzLTI1Ni1nY206cGFzcw@9.10.11.12:8388"
 ]
 ```
+Then click **Start Proxies**. Ports are assigned sequentially: first key → 10801, second → 10802, …
 
-**Q: How can I insert my proxies/proxy subcription into the proxy selection?**
-A: In the /Settings/subscriptions.json file, paste your proxies in the following json format:
-```Json
+**Q: How can I add my proxies / subscription to the proxy selection?**
+A: In `Settings/subscriptions.json`, paste your URLs or keys in the following JSON format:
+```json
 [
   "http://...",
   "https://...",
   "vless://...",
-  "YOUR_KEY_1",
-  "YOUR_KEY_2",
-  "YOUR_KEY_3"
+  "vmess://...",
+  "trojan://..."
 ]
 ```
+
+**Q: The UI freezes for ~30 seconds when many proxies are connected and clients are running**
+A: This should be fixed in recent versions — logs are now batched and flushed every 100 ms instead of triggering a UI redraw per line. If you still see freezes, check the console for what's producing the log flood (most likely `ports_proxies.py` stdout or bridge_receiver polling) and toggle **Show Proxy logs** off.
 
 ---
 
@@ -556,11 +591,15 @@ A: In the /Settings/subscriptions.json file, paste your proxies in the following
 - **Binary version:** v26.3.27
 - **SHA256:** `15C2D007954AC53BA69B80EC91242786B3C0B71D52649165B4CA1D5CC96EF8F1`
 
-### ProxiFyre
-- **Project:** https://github.com/username/ProxiFyre
-- **License:** AGPL-3.0
-- **Binary version:** v2.2.0
-- **SHA256:** `0CF61A431D02711DDD7F3D5DCA545DF8CE5F4B808AB34B713978AC272E1719D9`
+### python-v2ray
+- **Project:** https://github.com/arshiacomplus/python_v2ray
+- **License:** GPL-3.0 license
+- **Used for:** parsing v2ray share links (VLESS, VMess, Trojan, Shadowsocks, SOCKS, WireGuard, Hysteria, Hysteria2) into Xray outbound JSON configs
+
+### Flet
+- **Project:** https://github.com/flet-dev/flet
+- **License:** Apache-2.0
+- **Used for:** the entire UI framework
 
 ---
 
