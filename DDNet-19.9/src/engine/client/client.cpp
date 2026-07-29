@@ -706,7 +706,8 @@ void CClient::Connect(const char *pAddress, const char *pPassword)
 	else
 		m_aNetClient[CONN_MAIN].Connect(aConnectAddrs, NumConnectAddrs);
 
-	m_aNetClient[CONN_MAIN].RefreshStun();
+	if(!m_BotNet.IsProxyActive())
+		m_aNetClient[CONN_MAIN].RefreshStun();
 	SetState(IClient::STATE_CONNECTING);
 
 	m_InputtimeMarginGraph.Init(-150.0f, 150.0f);
@@ -5300,6 +5301,8 @@ int CClient::PredictionMargin() const
 
 int CClient::UdpConnectivity(int NetType)
 {
+	if(m_BotNet.IsProxyActive())
+		return CONNECTIVITY_UNKNOWN; // behind SOCKS5: STUN meaningless
 	static const int NETTYPES[2] = {NETTYPE_IPV6, NETTYPE_IPV4};
 	int Connectivity = CONNECTIVITY_UNKNOWN;
 	for(int PossibleNetType : NETTYPES)

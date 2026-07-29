@@ -21,8 +21,8 @@ def patch_script(src, dst):
         'sys.argv[0]'
     )
     c = c.replace(
-        'optimal_proxies_new.py',
-        'optimal_proxies_new.exe'
+        'optimal_proxies.py',
+        'optimal_proxies.exe'
     )
     c = c.replace(
         'ports_proxies.py',
@@ -68,7 +68,7 @@ def main():
     ui_dst = os.path.join(temp_dir, "UI.py")
     patch_script(ui_src, ui_dst)
 
-    for name in ['ports_proxies.py', 'optimal_proxies_new.py']:
+    for name in ['ports_proxies.py', 'optimal_proxies.py']:
         src = os.path.join(BASE_DIR, name)
         if os.path.exists(src):
             patch_script(src, os.path.join(temp_dir, name))
@@ -76,7 +76,7 @@ def main():
     scripts = {
         'UI':           ui_dst,
         'ports_proxies':       os.path.join(temp_dir, 'ports_proxies.py'),
-        'optimal_proxies_new': os.path.join(temp_dir, 'optimal_proxies_new.py'),
+        'optimal_proxies': os.path.join(temp_dir, 'optimal_proxies.py'),
     }
 
     datas = []
@@ -98,7 +98,7 @@ datas = [
 
 hiddenimports = [
     'flet', 'psutil', 'asyncio', 'threading',
-    'ports_proxies', 'optimal_proxies_new',
+    'ports_proxies', 'optimal_proxies',
 ]
 
 compiled_apps = []
@@ -162,7 +162,7 @@ coll = COLLECT(
         print("❌ Output folder not found")
         return
 
-    for folder in ['DDNets-19.9-win64', 'ProxiFyre', 'Settings', 'Macros', 'Scripts', 'Temp']:
+    for folder in ['DDNet-19.9-win64', 'Settings', 'Macros', 'Scripts', 'Temp']:
         src = os.path.join(BASE_DIR, folder)
         dst = os.path.join(out, folder)
         if os.path.exists(src) and not os.path.exists(dst):

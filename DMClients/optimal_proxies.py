@@ -9,10 +9,11 @@ import time
 import re
 import socket
 import ssl
-import struct
+
 import threading
 import queue
 import atexit
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -40,9 +41,20 @@ GAME_TEST_PORT = 10801
 
 SPARE_COUNT = 0
 
-TARGET_SERVER = "45.141.57.22:8390"
-PROXIFYRE_PATH = r"proxifyre/proxifyre.exe"
-DDNET_PATH = r"ddnets-19.9-win64/hddnet1.exe"
+# When True, proxies whose exit IP is in bproxies.json are SKIPPED during
+# the selection loop. When False, banned IPs are still RECORDED (ban_ip()
+# is always called when a proxy gets banned in-game) but not filtered out —
+# useful for servers without IP-based protection.
+USE_BANNED_FILTER = True
+
+# Comma-separated list of DDNet servers to test proxies against.
+# A random one is picked at startup (see main()).
+TARGET_SERVERS = ["45.141.57.22:8390", "46.174.54.240:8406", "46.174.54.240:8451", "46.174.54.240:8360"]
+# Backward-compat: legacy code reads TARGET_SERVER as a single string.
+TARGET_SERVER = TARGET_SERVERS[0] if TARGET_SERVERS else "45.141.57.22:8390"
+DDNET_PATH = r"DDNet-19.9-win64/DDNet.exe"
+
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 
 PROTOCOLS = ("vless://", "vmess://", "ss://", "shadowsocks://", "trojan://", "hysteria://", "hysteria2://", "hy://", "hy2://", "socks5://", "socks://")
 
@@ -98,18 +110,11 @@ _DEFAULT_SUBS = [
     "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
     "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha.txt",
     "https://openproxylist.com/v2ray/rawlist/subscribe",
+    "https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/whitelist.txt",
+    "https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/blacklist.txt",
 
-    # 5000+:
-    # "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/refs/heads/main/proxies/protocols/socks5/data.txt",
-
-    # 1500+:
-    # "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/refs/heads/main/subscriptions/v2ray/all_sub.txt",
-    # "https://raw.githubusercontent.com/barry-far/V2ray-Config/refs/heads/main/All_Configs_base64_Sub.txt",
     "https://raw.githubusercontent.com/ShatakVPN/ConfigForge-V2Ray/refs/heads/main/configs/all.txt",
-    # "https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/all-proxies.txt",
     "https://raw.githubusercontent.com/v0id9/vpn-configs/refs/heads/main/vpn.txt",
-    # "https://raw.githubusercontent.com/Danialsamadi/v2go/refs/heads/main/AllConfigsSub.txt",
-    # "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/refs/heads/main/V2Ray-Config-By-EbraSha-All-Type.txt",
 
     # 300–1500:
     "https://raw.githubusercontent.com/Reallyza/ReallyzaVpn/refs/heads/main/ALL%20CONF-WH%2BWIFI",
@@ -123,7 +128,7 @@ _DEFAULT_SUBS = [
 
     # 10–100:
     "https://gist.githubusercontent.com/DestroyST6767/f00837ad379aa3272183fdaabcfd50da/raw",
-    "https://raw.githubusercontent.com/cinev505/VlessTrogan-vpn-key/refs/heads/main/WhiteList-VPN-Vless", 
+    "https://raw.githubusercontent.com/cinev505/VlessTrogan-vpn-key/refs/heads/main/WhiteList-VPN-Vless",
     "https://raw.githubusercontent.com/pyatovsergey0105-maker/-/refs/heads/main/Whie_spiksik",
 
     # <10:
@@ -158,9 +163,9 @@ SUB_URLS = load_subs()
 # ─── Process management ───────────────────────────────────────────────────────
 
 def kill_all():
-    """Kill xray.exe, proxifyre.exe, hddnet1.exe — taskkill in parallel."""
+    """Kill xray.exe, DDNet.exe — taskkill in parallel."""
     procs = []
-    for name in ("xray.exe", "proxifyre.exe", "hddnet1.exe"):
+    for name in ("xray.exe", "DDNet.exe"):
         try:
             p = subprocess.Popen(
                 ["taskkill", "/F", "/IM", name],
@@ -208,9 +213,7 @@ atexit.register(_emergency_cleanup)
 # ─── Port manager ─────────────────────────────────────────────────────────────
 
 def port_alloc(index: int) -> int:
-    """Allocate a port for thread with given index. No is_port_free — just
-    allocate a unique port from the range. If port is occupied (rare) — xray
-    will fail on startup, wait_for_port won't succeed, test will fail."""
+    """Allocate a port for thread with given index."""
     base = START_PORT + index * 2
     with _ports_lock:
         port = base
@@ -250,12 +253,12 @@ def resolve_host(host: str) -> str:
     return ip
 
 
-def wait_for_port(port: int, timeout: float = 4.0) -> bool:
+def wait_for_port(port: int, timeout: float = 5.0) -> bool:
     """Wait until port starts accepting TCP connections."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.3):
+            with socket.create_connection(("127.0.0.1", port), timeout=0.5):
                 return True
         except (ConnectionRefusedError, OSError):
             time.sleep(0.1)
@@ -264,8 +267,68 @@ def wait_for_port(port: int, timeout: float = 4.0) -> bool:
 
 # ─── Subscription loading (PARALLEL) ──────────────────────────────────────────
 
+def _try_base64_decode(text: str) -> str | None:
+    """Try to base64-decode text with multiple strategies. Returns decoded string or None."""
+    text = text.strip()
+    if not text:
+        return None
+    # Strategy 1: Standard base64 with padding
+    try:
+        padded = text + "=" * (-len(text) % 4)
+        return base64.b64decode(padded).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    # Strategy 2: URL-safe base64 with padding
+    try:
+        padded = text + "=" * (-len(text) % 4)
+        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    # Strategy 3: Try without any padding
+    try:
+        return base64.b64decode(text).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+    return None
+
+
+def _extract_keys_from_lines(text: str) -> list[str]:
+    """Extract proxy keys from text content (line by line), cleaning noise."""
+    keys = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Remove BOM, brackets
+        line = line.lstrip('\ufeff')
+        line = line.replace("[", "").replace("]", "")
+        # Find protocol prefix — skip any noise before it (emoji, spaces, etc.)
+        for proto in PROTOCOLS:
+            idx = line.find(proto)
+            if idx >= 0:
+                keys.append(line[idx:])
+                break
+    return keys
+
+
+def _clean_key(key: str) -> str | None:
+    """Clean a single key: strip noise, extract protocol part. Returns None if not a valid key."""
+    key = key.strip()
+    key = key.lstrip('\ufeff')
+    # Remove surrounding quotes
+    if len(key) >= 2 and ((key.startswith('"') and key.endswith('"')) or
+                           (key.startswith("'") and key.endswith("'"))):
+        key = key[1:-1].strip()
+    # Trim everything before the protocol prefix
+    for proto in PROTOCOLS:
+        idx = key.find(proto)
+        if idx >= 0:
+            return key[idx:]
+    return None
+
+
 def fetch_one_subscription(url: str) -> list[str]:
-    """Fetch keys from a single subscription."""
+    """Fetch keys from a single subscription with robust multi-strategy extraction."""
     if url.startswith(PROTOCOLS):
         return [url]
     try:
@@ -275,32 +338,43 @@ def fetch_one_subscription(url: str) -> list[str]:
     except Exception:
         return []
 
+    content = content.lstrip('\ufeff')
+    if not content:
+        return []
+
     keys: list[str] = []
-    # base64
-    try:
-        padded = content + "=" * (-len(content) % 4)
-        decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
-        raw = [l.strip() for l in decoded.splitlines() if l.strip()]
-        if any(l.startswith(PROTOCOLS) for l in raw):
-            keys = [l.replace("[", "").replace("]", "") for l in raw]
-    except Exception:
-        pass
+    seen_keys: set[str] = set()
 
-    # Plain text
-    if not keys:
-        raw = [l.strip() for l in content.splitlines() if l.strip()]
-        keys = [l.replace("[", "").replace("]", "") for l in raw]
+    def _add_key(k: str):
+        cleaned = _clean_key(k)
+        if cleaned and cleaned not in seen_keys:
+            seen_keys.add(cleaned)
+            keys.append(cleaned)
 
-    # Extract protocol part from lines that have prefixes before the key
-    # e.g. "🇪🇸 vless://..." → "vless://..."
-    cleaned = []
-    for k in keys:
-        for proto in PROTOCOLS:
-            idx = k.find(proto)
-            if idx >= 0:
-                cleaned.append(k[idx:])
-                break
-    return cleaned
+    # Strategy 1: Try base64 decode entire content
+    decoded = _try_base64_decode(content)
+    if decoded:
+        for k in _extract_keys_from_lines(decoded):
+            _add_key(k)
+
+    # Strategy 2: Plain text extraction (always try — catches keys that base64 missed)
+    for k in _extract_keys_from_lines(content):
+        _add_key(k)
+
+    # Strategy 3: Line-by-line base64 decode (for mixed content)
+    for line in content.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        is_key = any(line.startswith(p) for p in PROTOCOLS)
+        if is_key:
+            continue
+        decoded_line = _try_base64_decode(line)
+        if decoded_line:
+            for k in _extract_keys_from_lines(decoded_line):
+                _add_key(k)
+
+    return keys
 
 
 def fetch_all_subscriptions(urls: list[str]) -> list[str]:
@@ -352,399 +426,145 @@ def tls_ping(ip: str, port: int, sni: str | None = None,
 
 
 def test_proxy_udp_dns(proxy_port: int) -> float | None:
-    """Fast UDP check via SOCKS5 proxy (DNS request to 8.8.8.8). Returns latency (ms) or None."""
-    tcp_sock = udp_sock = None
+    """UDP check via SOCKS5 proxy (STUN Binding Request to Google STUN).
+    Returns latency (ms) or None."""
     try:
+        import socks as pysocks
         start = time.monotonic()
-        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_sock.settimeout(UDP_PING_TIMEOUT)
-        tcp_sock.connect(("127.0.0.1", proxy_port))
-        tcp_sock.sendall(b"\x05\x01\x00")
-        if tcp_sock.recv(2) != b"\x05\x00": return None
-        
-        tcp_sock.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
-        resp = tcp_sock.recv(10)
-        if len(resp) < 10 or resp[1] != 0x00: return None
-        
-        udp_relay_port = struct.unpack("!H", resp[8:10])[0]
-        dns_payload = struct.pack(">HHHHHH", 0xDEAD, 0x0100, 1, 0, 0, 0)
-        packet = b"\x00\x00\x00\x01" + socket.inet_aton("8.8.8.8") + struct.pack("!H", 53) + dns_payload
-        
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.settimeout(UDP_PING_TIMEOUT)
-        udp_sock.sendto(packet, ("127.0.0.1", udp_relay_port))
-        
-        data, _ = udp_sock.recvfrom(1024)
-        if len(data) > 10 and struct.unpack(">H", data[10:12])[0] == 0xDEAD:
-            return round((time.monotonic() - start) * 1000, 1)
+        # AF_INET socket — PySocks builds the SOCKS5 UDP request header with
+        # ATYP=4 (IPv6) automatically when the destination is an IPv6 string.
+        s = pysocks.socksocket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.set_proxy(pysocks.SOCKS5, "127.0.0.1", proxy_port)
+        s.settimeout(UDP_PING_TIMEOUT)
+
+        # STUN Binding Request (RFC 5389):
+        #   0x0001 = Binding Request, 0x2112 = magic cookie, 12 random bytes
+        stun_packet = b'\x00\x01\x00\x00\x21\x12\xa4\x42' + os.urandom(12)
+
+        s.sendto(stun_packet, ("2001:4860:4864:5:8000::1", 19302))
+        s.recv(128)
+        s.close()
+        return round((time.monotonic() - start) * 1000, 1)
     except Exception:
-        pass
-    finally:
-        for s in (tcp_sock, udp_sock):
-            if s:
-                try: s.close()
-                except: pass
-    return None
+        return None
 
 
 # ─── Key parsing ──────────────────────────────────────────────────────────────
 
-def _decode_vmess_base64(key: str) -> str:
-    """Try to decode vmess://base64(json) into a standard vmess URI
-    that python_v2ray can parse. Returns original key if decoding fails."""
-    if not key.startswith("vmess://"):
-        return key
-    payload = key[len("vmess://"):]
-    if not payload:
-        return key
-    try:
-        # Fix base64 padding + handle URL-safe variants
-        padded = payload + "=" * (-len(payload) % 4)
-        decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
-        obj = json.loads(decoded)
-        if not isinstance(obj, dict):
-            return key
-        # Reconstruct a standard vmess:// URI from the JSON fields
-        # vmess JSON format: v, ps, add, port, id, aid, net, type, host, path, tls, sni, ...
-        v = obj.get("v", "2")
-        add = obj.get("add", "")
-        port = obj.get("port", "")
-        uid = obj.get("id", "")
-        aid = obj.get("aid", 0)
-        net = obj.get("net", "tcp")
-        ttype = obj.get("type", "none")        # kcp header type
-        host = obj.get("host", "")
-        path = obj.get("path", "")
-        tls = obj.get("tls", "")
-        sni = obj.get("sni", "")
-        alpn = obj.get("alpn", "")
-        fp = obj.get("fp", "")
-        pbk = obj.get("pbk", "")
-        sid = obj.get("sid", "")
-        flow = obj.get("flow", "")
-        scy = obj.get("scy", "auto")
-
-        if not add or not port or not uid:
-            return key
-
-        # Build SIP002-style vmess URI
-        # vmess://uuid@address:port?params#remark
-        params = []
-        params.append(f"type={net}")
-        if ttype and ttype != "none":
-            params.append(f"headerType={ttype}")
-        if host:
-            params.append(f"host={host}")
-        if path:
-            params.append(f"path={path}")
-        if tls:
-            params.append(f"security={tls}")
-        else:
-            params.append("security=none")
-        if sni:
-            params.append(f"sni={sni}")
-        if alpn:
-            params.append(f"alpn={alpn}")
-        if fp:
-            params.append(f"fp={fp}")
-        if pbk:
-            params.append(f"pbk={pbk}")
-        if sid:
-            params.append(f"sid={sid}")
-        if flow:
-            params.append(f"flow={flow}")
-        if scy and scy != "auto":
-            params.append(f"encryption={scy}")
-
-        query = "&".join(params)
-        remark = obj.get("ps", "")
-        fragment = f"#{remark}" if remark else ""
-
-        return f"vmess://{uid}@{add}:{port}?{query}{fragment}"
-    except Exception:
-        return key
-
-
 def parse_key(key: str) -> dict | None:
+    """Parse a proxy key into an xray outbound config dict.
+
+    Uses python_v2ray.XrayConfigBuilder for vless/vmess/trojan/ss/socks so
+    that streamSettings are built correctly for every transport (TCP
+    headerType, REALITY, WS, gRPC, KCP, ...). Falls back to manual
+    construction for hysteria/hysteria2/wireguard (not supported by
+    XrayConfigBuilder at the time of writing).
+    """
     try:
-        from python_v2ray.config_parser import parse_uri
+        from python_v2ray.config_parser import parse_uri, XrayConfigBuilder
 
-        if key.startswith("socks5://"):
-            key = "socks://" + key[len("socks5://"):]
-        elif key.startswith("shadowsocks://"):
-            key = "ss://" + key[len("shadowsocks://"):]
-        elif key.startswith("hy://"):
-            key = "hysteria://" + key[len("hy://"):]
-        elif key.startswith("hy2://"):
-            key = "hysteria2://" + key[len("hy2://"):]
+        k = key
+        if k.startswith("socks5://"):
+            k = "socks://" + k[len("socks5://"):]
+        elif k.startswith("shadowsocks://"):
+            k = "ss://" + k[len("shadowsocks://"):]
+        elif k.startswith("hy://"):
+            k = "hysteria://" + k[len("hy://"):]
+        elif k.startswith("hy2://"):
+            k = "hysteria2://" + k[len("hy2://"):]
 
-        # vmess://base64(json) — try decoding before parse_uri
-        if key.startswith("vmess://"):
-            key = _decode_vmess_base64(key)
+        p = parse_uri(k)
+        if p is None:
+            return None
 
-        p = parse_uri(key)
-        server = getattr(p, "address", None) or getattr(p, "server", None) or getattr(p, "host", None)
+        server = getattr(p, "address", None) or getattr(p, "server", None)
         if not server:
             return None
 
-        # ---------- VLESS / VMESS ----------
-        if p.protocol in ("vless", "vmess"):
-            ob: dict = {
-                "protocol": p.protocol,
-                "settings": {"vnext": [{"address": server, "port": p.port,
-                    "users": [{"id": getattr(p, "id", getattr(p, "uuid", "")),
-                               "encryption": getattr(p, "encryption", "none"),
-                               "flow": getattr(p, "flow", "")}]}]},
-                "streamSettings": {"network": getattr(p, "network", "tcp"),
-                                   "security": getattr(p, "security", "none")}
-            }
-            network = ob["streamSettings"]["network"]
-            security = ob["streamSettings"]["security"]
+        # ----- Protocols supported by XrayConfigBuilder -----
+        if p.protocol in ("vless", "mvless", "vmess", "trojan", "ss", "shadowsocks", "socks"):
+            builder = XrayConfigBuilder()
+            outbound = builder.build_outbound_from_params(p)
+            if outbound:
+                outbound.pop("tag", None)
+                return outbound
 
-            # WebSocket
-            if network == "ws":
-                ws = {}
-                if hasattr(p, "path"):
-                    ws["path"] = p.path
-                if hasattr(p, "host"):
-                    ws["headers"] = {"Host": p.host}
-                ob["streamSettings"]["wsSettings"] = ws
-
-            # gRPC
-            elif network == "grpc":
-                grpc = {}
-                if hasattr(p, "serviceName"):
-                    grpc["serviceName"] = p.serviceName
-                if hasattr(p, "mode"):
-                    grpc["multiMode"] = p.mode == "multi"
-                ob["streamSettings"]["grpcSettings"] = grpc
-
-            # HTTP/2
-            elif network == "http":
-                http = {}
-                if hasattr(p, "host"):
-                    http["host"] = [p.host] if isinstance(p.host, str) else p.host
-                if hasattr(p, "path"):
-                    http["path"] = p.path
-                ob["streamSettings"]["httpSettings"] = http
-
-            # mKCP
-            elif network == "kcp":
-                kcp = {"congestion": True}
-                if hasattr(p, "header"):
-                    kcp["header"] = {"type": p.header}
-                elif hasattr(p, "headerType"):
-                    kcp["header"] = {"type": p.headerType}
-                if hasattr(p, "seed"):
-                    kcp["seed"] = p.seed
-                ob["streamSettings"]["kcpSettings"] = kcp
-
-            # QUIC (used by some configs as network type)
-            elif network == "quic":
-                quic = {}
-                if hasattr(p, "header"):
-                    quic["header"] = {"type": p.header}
-                elif hasattr(p, "headerType"):
-                    quic["header"] = {"type": p.headerType}
-                if hasattr(p, "quicSecurity"):
-                    quic["security"] = p.quicSecurity
-                if hasattr(p, "key"):
-                    quic["key"] = p.key
-                ob["streamSettings"]["quicSettings"] = quic
-
-            # TLS / Reality
-            if security == "tls":
-                tls_cfg = {
-                    "serverName": getattr(p, "sni", server),
-                    "allowInsecure": getattr(p, "allowInsecure", False)
-                }
-                if hasattr(p, "fingerprint"):
-                    tls_cfg["fingerprint"] = p.fingerprint
-                if hasattr(p, "alpn"):
-                    alpn_val = p.alpn
-                    if isinstance(alpn_val, str):
-                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                    tls_cfg["alpn"] = alpn_val
-                ob["streamSettings"]["tlsSettings"] = tls_cfg
-            elif security == "reality":
-                reality_cfg = {
-                    "serverName": getattr(p, "sni", ""),
-                    "fingerprint": getattr(p, "fingerprint", "chrome"),
-                    "publicKey": getattr(p, "pbk", ""),
-                    "shortId": getattr(p, "sid", ""),
-                    "spiderX": getattr(p, "spiderX", "/")
-                }
-                if hasattr(p, "alpn"):
-                    alpn_val = p.alpn
-                    if isinstance(alpn_val, str):
-                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                    reality_cfg["alpn"] = alpn_val
-                ob["streamSettings"]["realitySettings"] = reality_cfg
-            return ob
-
-        # ---------- Shadowsocks / SS ----------
-        if p.protocol in ("shadowsocks", "ss"):
-            out = {
-                "protocol": "shadowsocks",
-                "settings": {"servers": [{"address": server, "port": p.port,
-                    "method": getattr(p, "method", "chacha20-ietf-poly1305"),
-                    "password": getattr(p, "password", "")}]}
-            }
-            if hasattr(p, "plugin"):
-                out["settings"]["servers"][0]["plugin"] = p.plugin
-                if hasattr(p, "pluginOpts"):
-                    out["settings"]["servers"][0]["pluginOpts"] = p.pluginOpts
-            # SS can have transport too (ws, etc.)
-            ss_network = getattr(p, "network", None)
-            if ss_network and ss_network != "tcp":
-                out["streamSettings"] = {"network": ss_network}
-                if ss_network == "ws":
-                    ws = {}
-                    if hasattr(p, "path"):
-                        ws["path"] = p.path
-                    if hasattr(p, "host"):
-                        ws["headers"] = {"Host": p.host}
-                    out["streamSettings"]["wsSettings"] = ws
-            return out
-
-        # ---------- Trojan ----------
-        if p.protocol == "trojan":
-            network = getattr(p, "network", "tcp")
-            security = getattr(p, "security", "tls")
-            out = {
-                "protocol": "trojan",
-                "settings": {"servers": [{"address": server, "port": p.port,
-                    "password": getattr(p, "password", getattr(p, "uuid", ""))}]},
-                "streamSettings": {"network": network, "security": security}
-            }
-            # TLS settings
-            if security in ("tls", "reality"):
-                if security == "tls":
-                    tls_cfg = {
-                        "serverName": getattr(p, "sni", server),
-                        "allowInsecure": getattr(p, "allowInsecure", False)
-                    }
-                    if hasattr(p, "fingerprint"):
-                        tls_cfg["fingerprint"] = p.fingerprint
-                    if hasattr(p, "alpn"):
-                        alpn_val = p.alpn
-                        if isinstance(alpn_val, str):
-                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                        tls_cfg["alpn"] = alpn_val
-                    out["streamSettings"]["tlsSettings"] = tls_cfg
-                elif security == "reality":
-                    out["streamSettings"]["realitySettings"] = {
-                        "serverName": getattr(p, "sni", ""),
-                        "fingerprint": getattr(p, "fingerprint", "chrome"),
-                        "publicKey": getattr(p, "pbk", ""),
-                        "shortId": getattr(p, "sid", ""),
-                        "spiderX": getattr(p, "spiderX", "/")
-                    }
-            # Transport
-            if network == "ws":
-                ws = {}
-                if hasattr(p, "path"):
-                    ws["path"] = p.path
-                if hasattr(p, "host"):
-                    ws["headers"] = {"Host": p.host}
-                out["streamSettings"]["wsSettings"] = ws
-            elif network == "grpc":
-                grpc = {}
-                if hasattr(p, "serviceName"):
-                    grpc["serviceName"] = p.serviceName
-                if hasattr(p, "mode"):
-                    grpc["multiMode"] = p.mode == "multi"
-                out["streamSettings"]["grpcSettings"] = grpc
-            elif network == "kcp":
-                kcp = {"congestion": True}
-                if hasattr(p, "header"):
-                    kcp["header"] = {"type": p.header}
-                elif hasattr(p, "headerType"):
-                    kcp["header"] = {"type": p.headerType}
-                if hasattr(p, "seed"):
-                    kcp["seed"] = p.seed
-                out["streamSettings"]["kcpSettings"] = kcp
-            return out
-
-        # ---------- Hysteria / Hysteria2 ----------
+        # ----- Hysteria / Hysteria2 (manual) -----
         if p.protocol in ("hysteria", "hysteria2"):
             out = {
                 "protocol": p.protocol,
                 "settings": {"servers": [{"address": server, "port": p.port,
-                    "password": getattr(p, "password", getattr(p, "auth", ""))}]},
+                    "password": getattr(p, "hy2_password", getattr(p, "password", ""))}]},
                 "streamSettings": {"network": "udp", "security": "tls",
                     "tlsSettings": {"serverName": getattr(p, "sni", server),
-                                    "allowInsecure": getattr(p, "allowInsecure", False)}}
+                                    "allowInsecure": False}}
             }
-            # TLS fingerprint & alpn for Hysteria
-            if hasattr(p, "fingerprint"):
-                out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fingerprint
-            if hasattr(p, "alpn"):
-                alpn_val = p.alpn
-                if isinstance(alpn_val, str):
-                    alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                out["streamSettings"]["tlsSettings"]["alpn"] = alpn_val
-
-            # Hysteria1 доп. поля
-            if p.protocol == "hysteria":
-                if hasattr(p, "up"):
-                    out["settings"]["servers"][0]["up_mbps"] = p.up
-                if hasattr(p, "down"):
-                    out["settings"]["servers"][0]["down_mbps"] = p.down
-                if hasattr(p, "obfs"):
-                    out["settings"]["servers"][0]["obfs"] = p.obfs
-
-            # Hysteria2 доп. поля
-            if p.protocol == "hysteria2":
-                if hasattr(p, "obfs"):
-                    out["settings"]["servers"][0]["obfs"] = {
-                        "type": getattr(p, "obfs", "salamander")
-                    }
-                    if hasattr(p, "obfs_password"):
-                        out["settings"]["servers"][0]["obfs"]["password"] = p.obfs_password
-                    elif hasattr(p, "obfsPassword"):
-                        out["settings"]["servers"][0]["obfs"]["password"] = p.obfsPassword
-                if hasattr(p, "congestion_control_type"):
-                    out["settings"]["servers"][0]["congestion_control_type"] = p.congestion_control_type
-                elif hasattr(p, "congestion"):
-                    out["settings"]["servers"][0]["congestion_control_type"] = p.congestion
-                # up/down speed for hy2
-                if hasattr(p, "up"):
-                    out["settings"]["servers"][0]["up_mbps"] = p.up
-                if hasattr(p, "down"):
-                    out["settings"]["servers"][0]["down_mbps"] = p.down
+            if getattr(p, "fp", ""):
+                out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fp
+            if getattr(p, "alpn", ""):
+                out["streamSettings"]["tlsSettings"]["alpn"] = [a.strip() for a in p.alpn.split(",") if a.strip()]
+            if p.protocol == "hysteria2" and getattr(p, "hy2_obfs", ""):
+                out["settings"]["servers"][0]["obfs"] = {
+                    "type": p.hy2_obfs,
+                    "password": getattr(p, "hy2_obfs_password", "")
+                }
             return out
 
-        # ---------- SOCKS (работает без изменений) ----------
-        if p.protocol == "socks":
-            users = []
-            user = getattr(p, "id", "")
-            passwd = getattr(p, "password", "")
-            if user:
-                users.append({"user": user, "pass": passwd})
-            return {"protocol": "socks",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                                               "users": users}]}}
+        # ----- WireGuard (manual) -----
+        if p.protocol == "wireguard":
+            reserved = []
+            if getattr(p, "wg_reserved", ""):
+                reserved = [int(i.strip()) for i in p.wg_reserved.split(",") if i.strip()]
+            return {
+                "protocol": "wireguard",
+                "settings": {
+                    "secretKey": getattr(p, "wg_secret_key", ""),
+                    "address": getattr(p, "wg_address", "172.16.0.2/32").split(","),
+                    "peers": [{"publicKey": getattr(p, "pbk", ""),
+                               "endpoint": f"{server}:{p.port}"}],
+                    "mtu": getattr(p, "wg_mtu", 1420),
+                    "reserved": reserved,
+                }
+            }
+
+        return None
     except Exception as e:
-        # Для отладки – замени pass на print, но не забудь убрать потом
-        print(f"Parse error: {e}")
-        pass
-    return None
+        console.print(f"[red]Parse error: {e}[/red]")
+        return None
 
-
-# ─── Proxy test ───────────────────────────────────────────────────────────────
 
 def _xray_config(port: int, outbound: dict) -> dict:
+    """Xray config — identical structure to test.py (proven to work)."""
     return {
         "log": {"loglevel": "none"},
-        "inbounds": [{"port": port, "listen": "127.0.0.1",
-                      "protocol": "socks", "settings": {"auth": "noauth", "udp": True}}],
-        "outbounds": [outbound],
+        "dns": {"servers": ["8.8.8.8", "1.1.1.1"], "tag": "dns-module"},
+        "inbounds": [{
+            "port": port,
+            "listen": "127.0.0.1",
+            "protocol": "mixed",
+            "sniffing": {
+                "enabled": True,
+                "destOverride": ["http", "tls"],
+                "routeOnly": False
+            },
+            "settings": {"auth": "noauth", "udp": True}
+        }],
+        "outbounds": [
+            outbound,
+            {"tag": "direct", "protocol": "freedom", "settings": {}}
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                {"type": "field", "inboundTag": "dns-module", "outboundTag": "direct"},
+                {"type": "field", "port": "53", "outboundTag": "direct"}
+            ]
+        }
     }
 
 
 def test_proxy(key: str, port: int, outbound: dict | None = None) -> tuple[float, str | None, float | None] | None:
-    """Launch xray, test HTTP via socks5 + background UDP check.
+    """Launch xray, test HTTP via socks5h + background UDP check.
     Returns (xray_ping_ms, exit_ip, udp_latency_ms) or None."""
     if _shutdown.is_set():
         return None
@@ -769,17 +589,20 @@ def test_proxy(key: str, port: int, outbound: dict | None = None) -> tuple[float
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-        if not wait_for_port(port, timeout=4.0):
+        if not wait_for_port(port, timeout=5.0):
             return None
 
-        proxies = {"http": f"socks5://127.0.0.1:{port}",
-                   "https": f"socks5://127.0.0.1:{port}"}
-        
-        # ── Get exit IP (also serves as XRAY ping) + Background UDP check ──
+        # socks5h — DNS резолвинг на стороне xray, не на клиенте
+        proxies = {
+            "http":  f"socks5h://127.0.0.1:{port}",
+            "https": f"socks5h://127.0.0.1:{port}"
+        }
+        headers = {"User-Agent": USER_AGENT}
+
         exit_ip = None
         xray_ping = None
         udp_latency = None
-        
+
         udp_res = [None]
         udp_done = threading.Event()
 
@@ -800,7 +623,8 @@ def test_proxy(key: str, port: int, outbound: dict | None = None) -> tuple[float
                     if _ip_done.is_set():
                         return
                     try:
-                        r = requests.get(url, proxies=proxies, timeout=IP_CHECK_TIMEOUT)
+                        r = requests.get(url, proxies=proxies, headers=headers,
+                                         timeout=IP_CHECK_TIMEOUT)
                         if r.status_code == 200:
                             ip = r.text.strip()
                             if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
@@ -825,12 +649,12 @@ def test_proxy(key: str, port: int, outbound: dict | None = None) -> tuple[float
         # Wait for UDP check to complete (max UDP_PING_TIMEOUT + 1s margin)
         if xray_ping is not None and not udp_done.is_set():
             udp_done.wait(timeout=UDP_PING_TIMEOUT + 1.0)
-            
+
         udp_latency = udp_res[0]
 
         if exit_ip is not None and xray_ping is not None:
             return (xray_ping, exit_ip, udp_latency)
-        
+
         return None
 
     except Exception:
@@ -947,7 +771,7 @@ def ban_ip(ip: str, banned: set[str]):
 # ─── DDNet visual test ────────────────────────────────────────────────────────
 
 def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_ips: set[str] | None = None) -> bool:
-    """xray + proxifyre + hddnet1 → test connection to server."""
+    """xray + DDNet.exe (with c_proxy) → test connection to server."""
     console.print(f"\n[cyan]🧪 {idx_info} DDNet: {key_preview(key)}[/cyan]")
 
     kill_all()
@@ -967,7 +791,23 @@ def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_
     except Exception:
         return False
 
-    xray_proc = proxy_proc = game_proc = None
+    xray_proc = game_proc = None
+    proxy_proc = None  # kept for finally-block compatibility (no longer used)
+    _disconnect_sent = False  # track so we don't send disconnect twice
+
+    def _send_disconnect():
+        """Send 'disconnect' to the DDNet client via bridge so it leaves the
+        server cleanly before we kill the process. Idempotent."""
+        nonlocal _disconnect_sent
+        if _disconnect_sent:
+            return
+        try:
+            with _bridge_lock:
+                if _bridge_clients:
+                    bridge_send("disconnect\n")
+                    _disconnect_sent = True
+        except Exception:
+            pass
 
     try:
         # ── xray.exe ──
@@ -979,14 +819,7 @@ def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_
             console.print("    [red]❌ Xray failed[/red]")
             return False
 
-        # ── proxifyre.exe ──
-        proxy_proc = subprocess.Popen(
-            [PROXIFYRE_PATH],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        time.sleep(0.5)
-
-        # ── hddnet1.exe (DDNet) ──
+        # ── DDNet.exe (no ProxiFyre — client routes via c_proxy command) ──
         si = subprocess.STARTUPINFO(dwFlags=1, wShowWindow=0)
         game_proc = subprocess.Popen(
             [DDNET_PATH],
@@ -1023,15 +856,19 @@ def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_
             if _shutdown.is_set():
                 break
 
-            # Send bridge command
             if not sent and not exited:
                 with _bridge_lock:
                     has_client = bool(_bridge_clients)
                 if has_client:
                     time.sleep(2)
-                    sent = bridge_send(f"player_name testbot; player_clan \"\"; player_skin default; connect {TARGET_SERVER}\n")
+                    # Route all client traffic through the SOCKS5 proxy started above.
+                    bridge_send(f"c_proxy 1 127.0.0.1:{GAME_TEST_PORT}\n")
+                    time.sleep(0.5)
+                    # Pick a random target server for THIS connect attempt.
+                    target = random.choice(TARGET_SERVERS) if TARGET_SERVERS else TARGET_SERVER
+                    console.print(f"    [dim]🎲 Target: {target}[/dim]")
+                    sent = bridge_send(f"player_name testbot; player_clan \"\"; player_skin default; connect {target}\n")
 
-            # Process stdout
             while not q.empty():
                 item = q.get_nowait()
                 if item is None:
@@ -1068,6 +905,11 @@ def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_
         console.print(f"    [red]❌ Error: {exc}[/red]")
         return False
     finally:
+        # Send 'disconnect' to DDNet client via bridge so it leaves the server
+        # cleanly, then wait 0.5s before killing the process.
+        if game_proc is not None and game_proc.poll() is None:
+            _send_disconnect()
+            time.sleep(0.5)
         for p in (game_proc, proxy_proc, xray_proc):
             if p is not None:
                 _kill_proc(p)
@@ -1082,9 +924,23 @@ def run_visual_test(key: str, idx_info: str, exit_ip: str | None = None, banned_
 # ─── Save results ─────────────────────────────────────────────────────────────
 
 def save_proxies(keys: list[str]):
-    proxies = [{"port": 10801 + i, "key": k} for i, k in enumerate(keys)]
+    """Save keys to proxies.json in the new format (settings + proxies list).
+
+    This is the "optimal proxies" pool — the candidate list that the UI's
+    "Check Proxy" button will later filter down into checked_proxies.json.
+    Ports are implied: 10801 + index. Existing settings are preserved."""
+    data = {}
     try:
-        PROXIES_JSON.write_text(json.dumps(proxies, indent=2, ensure_ascii=False), encoding="utf-8")
+        if PROXIES_JSON.exists():
+            with open(PROXIES_JSON, "r", encoding="utf-8") as f:
+                data = json.load(f)
+    except Exception:
+        data = {}
+    if "settings" not in data or not isinstance(data["settings"], dict):
+        data["settings"] = {}
+    data["proxies"] = list(keys)
+    try:
+        PROXIES_JSON.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         console.print(f"\n[green]✅ {PROXIES_JSON} — {len(keys)} keys[/green]")
     except Exception as e:
         console.print(f"[red]❌ Save failed: {e}[/red]")
@@ -1114,16 +970,25 @@ class Counter:
 # ─── Main function ────────────────────────────────────────────────────────────
 
 def main():
-    global TARGET_SERVER, TCP_PING_TIMEOUT, TLS_PING_TIMEOUT, UDP_PING_TIMEOUT, IP_CHECK_TIMEOUT
+    global TARGET_SERVERS, TARGET_SERVER, TCP_PING_TIMEOUT, TLS_PING_TIMEOUT, UDP_PING_TIMEOUT, IP_CHECK_TIMEOUT, MAX_WORKERS, USE_BANNED_FILTER
 
-    # Arguments
     use_spare = False
     spare_count = SPARE_COUNT
     top_n = TOP_N
+    use_ddnet_test = True
 
     for arg in sys.argv[1:]:
-        if arg.startswith("--target-server="):
+        if arg.startswith("--target-servers="):
+            # Comma-separated list of servers. A random one is picked before
+            # every connect attempt in _test_proxy_in_game (not just once here).
+            raw = arg.split("=", 1)[1]
+            TARGET_SERVERS = [s.strip() for s in raw.split(",") if s.strip()]
+            if TARGET_SERVERS:
+                TARGET_SERVER = TARGET_SERVERS[0]  # placeholder; overwritten per-test
+        elif arg.startswith("--target-server="):
+            # Backward-compat: single server from old --target-server=...
             TARGET_SERVER = arg.split("=", 1)[1]
+            TARGET_SERVERS = [TARGET_SERVER]
         elif arg.startswith("--spare-proxies"):
             use_spare = True
             if "=" in arg:
@@ -1140,14 +1005,26 @@ def main():
                 IP_CHECK_TIMEOUT = t
             except ValueError:
                 pass
+        elif arg.startswith("--threads="):
+            try:
+                MAX_WORKERS = int(arg.split("=", 1)[1])
+                if MAX_WORKERS < 1:
+                    MAX_WORKERS = 1
+            except ValueError:
+                pass
+        elif arg.startswith("--skip-ddnet"):
+            use_ddnet_test = False
+        elif arg.startswith("--banned-filter="):
+            USE_BANNED_FILTER = arg.split("=", 1)[1].lower() in ("1", "true", "yes", "on")
         elif arg.startswith("--top-n="):
             try:
                 top_n = int(arg.split("=", 1)[1])
             except ValueError:
                 pass
 
-    console.print(f"[cyan]📡 Target: {TARGET_SERVER}[/cyan]")
+    console.print(f"[cyan]📡 Target servers: {TARGET_SERVERS}[/cyan]")
     console.print(f"[cyan]🎯 Top: {top_n} | Spare: {spare_count if use_spare else 'off'}[/cyan]")
+    console.print(f"[cyan]🔧 Threads: {MAX_WORKERS} | DDNet test: {'on' if use_ddnet_test else 'off'}[/cyan]")
     if any(a.startswith("--timeout=") for a in sys.argv[1:]):
         console.print(f"[cyan]⌛ Timeout: {TCP_PING_TIMEOUT}s[/cyan]")
 
@@ -1168,13 +1045,10 @@ def main():
     except (OSError, AttributeError):
         pass
 
-    # Bridge
     threading.Thread(target=start_bridge, daemon=True).start()
 
     try:
-        # ══════════════════════════════════════════════════════════════════
         # 1. LOAD SUBSCRIPTIONS (parallel)
-        # ══════════════════════════════════════════════════════════════════
         console.print("\n[bold]📥 Fetching subscriptions (parallel)...[/bold]")
         all_keys = fetch_all_subscriptions(SUB_URLS)
 
@@ -1184,9 +1058,7 @@ def main():
 
         console.print(f"\n[cyan]📊 Total: {len(all_keys)} raw keys[/cyan]")
 
-        # ══════════════════════════════════════════════════════════════════
-        # 2. DEDUPLICATION + FILTERING (fast, in-memory)
-        # ══════════════════════════════════════════════════════════════════
+        # 2. DEDUPLICATION + FILTERING
         seen: set[str] = set()
         deduped: list[str] = []
         for k in all_keys:
@@ -1202,10 +1074,8 @@ def main():
             console.print("[red]❌ No keys to test[/red]")
             return
 
-        # ══════════════════════════════════════════════════════════════════
         # 3. PROXY TESTING (ThreadPoolExecutor, polling)
-        # ══════════════════════════════════════════════════════════════════
-        results: list[tuple[float, str | None, float | None, str]] = []  # (ping, exit_ip, udp_latency, key)
+        results: list[tuple[float, str | None, float | None, str]] = []
         results_lock = threading.Lock()
         counter = Counter(0)
         total = len(keys)
@@ -1225,14 +1095,12 @@ def main():
                 progress.update(task_id, advance=1)
                 return
 
-            # ── Parse key once ──
             outbound = parse_key(key)
             if outbound is None:
                 done = counter.inc()
                 progress.update(task_id, advance=1)
                 return
 
-            # ── Extract address/port from outbound config ──
             settings = outbound.get("settings", {})
             vnext = settings.get("vnext")
             if vnext:
@@ -1247,10 +1115,8 @@ def main():
                 progress.update(task_id, advance=1)
                 return
 
-            # ── DNS resolve ──
             ip = resolve_host(host)
 
-            # ── Determine if TLS is needed ──
             stream = outbound.get("streamSettings", {})
             security = stream.get("security", "")
             needs_tls = security in ("tls", "reality")
@@ -1259,23 +1125,18 @@ def main():
                 tls_key = "tlsSettings" if security == "tls" else "realitySettings"
                 sni = stream.get(tls_key, {}).get("serverName") or host
 
-            # ── TCP/TLS prefilter (skip for Hysteria — it uses QUIC, not TCP) ──
             protocol = outbound.get("protocol", "")
             is_udp = protocol in ("hysteria", "hysteria2")
 
             tcp = None
             tls = None
+            ping_parts: list[str] = []
 
             if not is_udp:
-                # ── TCP ping ──
                 tcp = tcp_ping(ip, port_srv)
-
-                # ── TLS ping (if protocol requires it) ──
-                tls = None
                 if needs_tls and tcp is not None:
                     tls = tls_ping(ip, port_srv, sni)
 
-                # ── Dead server? → skip ──
                 if tcp is None or (needs_tls and tls is None):
                     done = counter.inc()
                     with results_lock:
@@ -1284,7 +1145,10 @@ def main():
                         progress.update(task_id, advance=1)
                     return
 
-            # ── Ping passed → full xray test ──
+                ping_parts.append(f"TCP:{tcp}ms")
+                if needs_tls and tls is not None:
+                    ping_parts.append(f"TLS:{tls}ms")
+
             port = port_alloc(i)
             try:
                 res = test_proxy(key, port, outbound)
@@ -1296,10 +1160,6 @@ def main():
                 if _shutdown.is_set():
                     return
                 pv = key_preview(key)[:45]
-                if tcp is not None:
-                    ping_parts = [f"TCP:{tcp}ms"]
-                if needs_tls and tls is not None:
-                    ping_parts.append(f"TLS:{tls}ms")
                 if res is not None:
                     ping_ms, exit_ip, udp_latency = res
                     if exit_ip is not None and udp_latency is not None:
@@ -1335,17 +1195,15 @@ def main():
                         else:
                             still_running.append(f)
                     futures = still_running
-                    time.sleep(0.08)  # polling ~12 times/sec — fast enough
+                    time.sleep(0.08)
         except KeyboardInterrupt:
             _shutdown.set()
         finally:
-            # Don't wait for threads — kill everything
             ex.shutdown(wait=False)
             kill_all()
 
         if _shutdown.is_set():
             console.print("\n[yellow]⚠️ Interrupted during testing[/yellow]")
-            # Still show what we managed to find
             if not results:
                 return
 
@@ -1355,9 +1213,7 @@ def main():
             console.print("[red]❌ No working proxies[/red]")
             return
 
-        # ══════════════════════════════════════════════════════════════════
         # 4. DEDUPLICATION BY EXIT IP
-        # ══════════════════════════════════════════════════════════════════
         best: dict[str, tuple[float, str | None, float | None, str]] = {}
         for ping, exit_ip, udp_latency, key in results:
             dedup_key = exit_ip or resolve_host(key_identity(key).split(":")[0])
@@ -1366,52 +1222,56 @@ def main():
         results = sorted(best.values(), key=lambda x: x[0])
         console.print(f"[green]✅ {len(results)} unique exit IPs[/green]")
 
-        # ══════════════════════════════════════════════════════════════════
         # 5. LOAD BAN LIST + FILTERING
-        # ══════════════════════════════════════════════════════════════════
+        # banned_ips is always loaded (so ban_ip() can still record new bans
+        # during the in-game test), but the filter step is gated by USE_BANNED_FILTER.
         banned_ips = load_banned_ips()
 
-        results_filtered: list[tuple[float, str | None, float | None, str]] = []
-        for ping, exit_ip, udp_latency, key in results:
-            if exit_ip and exit_ip in banned_ips:
-                continue
-            results_filtered.append((ping, exit_ip, udp_latency, key))
+        if USE_BANNED_FILTER:
+            results_filtered: list[tuple[float, str | None, float | None, str]] = []
+            for ping, exit_ip, udp_latency, key in results:
+                if exit_ip and exit_ip in banned_ips:
+                    continue
+                results_filtered.append((ping, exit_ip, udp_latency, key))
 
-        skipped = len(results) - len(results_filtered)
-        if skipped:
-            console.print(f"[yellow]🚫 Banned IPs: {skipped}[/yellow]")
-        results = results_filtered
+            skipped = len(results) - len(results_filtered)
+            if skipped:
+                console.print(f"[yellow]🚫 Banned IPs filtered: {skipped}[/yellow]")
+            results = results_filtered
 
-        if not results:
-            console.print("[red]❌ No proxies left after ban filter[/red]")
-            return
+            if not results:
+                console.print("[red]❌ No proxies left after ban filter[/red]")
+                return
+        else:
+            console.print("[cyan]🚫 Banned filter disabled[/cyan]")
 
-        # ══════════════════════════════════════════════════════════════════
         # 6. DDNET VALIDATION
-        # ══════════════════════════════════════════════════════════════════
-        console.print(f"\n[cyan]🎮 DDNet validation (need {top_n})...[/cyan]")
-        confirmed: list[str] = []
-        tested: set[int] = set()
+        if use_ddnet_test:
+            console.print(f"\n[cyan]🎮 DDNet validation (need {top_n})...[/cyan]")
+            confirmed: list[str] = []
+            tested: set[int] = set()
 
-        for idx, (ping, exit_ip, udp_latency, key) in enumerate(results):
-            if _shutdown.is_set():
-                break
-            if len(confirmed) >= top_n:
-                break
-            tested.add(idx)
-            if run_visual_test(key, f"#{len(confirmed) + 1}", exit_ip=exit_ip, banned_ips=banned_ips):
-                confirmed.append(key)
+            for idx, (ping, exit_ip, udp_latency, key) in enumerate(results):
+                if _shutdown.is_set():
+                    break
+                if len(confirmed) >= top_n:
+                    break
+                tested.add(idx)
+                if run_visual_test(key, f"#{len(confirmed) + 1}", exit_ip=exit_ip, banned_ips=banned_ips):
+                    confirmed.append(key)
 
-        if not confirmed:
-            console.print("[red]❌ No confirmed proxies[/red]")
-            return
+            if not confirmed:
+                console.print("[red]❌ No confirmed proxies[/red]")
+                return
 
-        save_proxies(confirmed)
+            save_proxies(confirmed)
+        else:
+            console.print(f"\n[yellow]⏭️ DDNet test skipped — saving top {top_n} by ping[/yellow]")
+            confirmed = [key for _, _, _, key in results[:top_n]]
+            save_proxies(confirmed)
 
-        # ══════════════════════════════════════════════════════════════════
         # 7. SPARE PROXIES
-        # ══════════════════════════════════════════════════════════════════
-        if use_spare:
+        if use_spare and use_ddnet_test:
             console.print(f"\n[cyan]📦 Spare ({spare_count})...[/cyan]")
             spare: list[str] = []
             for idx, (ping, exit_ip, udp_latency, key) in enumerate(results):

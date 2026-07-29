@@ -121,6 +121,8 @@ void CBotNet::Init(IClient *pClient, CBotControl *pBotControl, IConsole *pConsol
 	m_pConsole = pConsole;
 	m_pGameChild = (CGameClient *)pGameClient;
 
+	m_Socks5Proxy.SetConsole(m_pConsole);
+
 	m_pConsole->Register("c_random_aim", "i[on] ?i[ms]", CFGFLAG_CLIENT, ConRandomAim, this, "Random Aim");
 	m_pConsole->Register("c_copy_moves", "i[target_id]", CFGFLAG_CLIENT, ConCopyMoves, this, "Copy Moves");
 	m_pConsole->Register("c_attack", "i[on]", CFGFLAG_CLIENT, ConAttackEnable, this, "Attack Mode");
@@ -145,6 +147,7 @@ void CBotNet::Init(IClient *pClient, CBotControl *pBotControl, IConsole *pConsol
 	m_pConsole->Register("c_macro_record", "i[on]", CFGFLAG_CLIENT, ConMacroRecord, this, "Record macro (1=start, 0=stop)");
 	m_pConsole->Register("c_macro_save", "s[path]", CFGFLAG_CLIENT, ConMacroSave, this, "Save recorded macro to file");
 	m_pConsole->Register("c_macro_capture", "i[id]", CFGFLAG_CLIENT, ConMacroCapture, this, "Set capture ID for macro recording");
+	m_pConsole->Register("c_proxy", "i[on] ?s[host:port]", CFGFLAG_CLIENT, ConProxy, this, "Enable (1) / disable (0) SOCKS5 proxy. Usage: c_proxy 1 127.0.0.1:10801");
 }
 
 // =========================================================
@@ -929,6 +932,8 @@ void CBotNet::GetMovementFromFlow(bool &outLeft, bool &outRight, bool &outJump)
 
 void CBotNet::OnTick()
 {
+	m_Socks5Proxy.Update();
+
 	if(!m_pClient || !m_pBotControl || !m_pConsole || !m_pGameChild)
 		return;
 	if(m_pClient->State() != 3 && m_pClient->State() != 5)
@@ -2213,4 +2218,32 @@ void CBotNet::ConPathfinderGo(IConsole::IResult *pResult, void *pUserData)
 		p->m_PathfinderGoPos = vec2(x * 32.0f + 16.0f, y * 32.0f + 16.0f); // центр тайла
 		dbg_msg("botnet", "Pathfinder go to tile (%d, %d) -> pos (%.0f, %.0f)", x, y, p->m_PathfinderGoPos.x, p->m_PathfinderGoPos.y);
 	}
+}
+void CBotNet::ConProxy(IConsole::IResult *pResult, void *pUserData)
+{
+	CBotNet *p = (CBotNet *)pUserData;
+	int On = pResult->GetInteger(0);
+
+	if(On == 0)
+	{
+		p->m_Socks5Proxy.Disable();
+		return;
+	}
+
+	// On != 0: require a host:port argument.
+	if(pResult->NumArguments() < 2)
+	{
+		p->m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "botnet",
+			"c_proxy: usage 'c_proxy 1 IP:PORT' (e.g. c_proxy 1 127.0.0.1:10801)");
+		return;
+	}
+
+	const char *pAddr = pResult->GetString(1);
+	if(!pAddr || !pAddr[0])
+	{
+		p->m_pConsole->Print(IConsole::OUTPUT_LEVEL_STANDARD, "botnet", "c_proxy: empty address");
+		return;
+	}
+
+	p->m_Socks5Proxy.Enable(pAddr);
 }

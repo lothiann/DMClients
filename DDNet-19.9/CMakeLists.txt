@@ -2339,11 +2339,13 @@ if(CLIENT)
     bridge.cpp
     bot_control.cpp
     botnet.cpp
+    socks5_proxy.cpp
     sleep.cpp
     client.h
     bridge.h
     bot_control.h
     botnet.h
+    socks5_proxy.h
     sleep.h
     demoedit.cpp
     demoedit.h

@@ -3,6 +3,7 @@
 
 #include <base/vmath.h>
 
+#include <engine/client/socks5_proxy.h>
 #include <engine/console.h>
 
 #include <string>
@@ -121,6 +122,9 @@ public:
 	vec2 m_LastPos;
 	int m_StuckTicks;
 
+	// SOCKS5 proxy (whole-client traffic redirect)
+	CSocks5Proxy m_Socks5Proxy;
+
 	CBotNet();
 	void Init(IClient *pClient, CBotControl *pBotControl, IConsole *pConsole, IGameClient *pGameClient);
 	void OnTick();
@@ -165,6 +169,11 @@ public:
 	static void ConMacroRecord(IConsole::IResult *pResult, void *pUserData);
 	static void ConMacroSave(IConsole::IResult *pResult, void *pUserData);
 	static void ConMacroCapture(IConsole::IResult *pResult, void *pUserData);
+
+	static void ConProxy(IConsole::IResult *pResult, void *pUserData);
+
+	// SOCKS5 proxy access (used by CClient to skip STUN when proxied)
+	bool IsProxyActive() const { return m_Socks5Proxy.IsActive(); }
 };
 
 #endif

@@ -1,1 +1,8 @@
-[]
+{
+  "settings": {
+    "clients_per_proxy": 2,
+    "num_clients": 28,
+    "proxy_limit": 14
+  },
+  "proxies": []
+}

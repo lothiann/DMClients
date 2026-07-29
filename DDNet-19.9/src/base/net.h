@@ -399,6 +399,84 @@ int net_tcp_recv(NETSOCKET sock, void *data, int maxsize);
  */
 void net_tcp_close(NETSOCKET sock);
 
+/**
+ * Apply a send/recv timeout (in milliseconds) to the underlying socket.
+ * A timeout of 0 clears the timeout (socket becomes blocking without one).
+ *
+ * @ingroup Network-General
+ *
+ * @param sock Socket to configure.
+ * @param timeout_ms Timeout in milliseconds, or 0 to clear.
+ */
+void net_set_socket_timeout(NETSOCKET sock, int timeout_ms);
+
+/**
+ * Get the raw underlying socket file descriptor for use with select() /
+ * setsockopt() / etc. Returns the IPv4 fd if available, otherwise the IPv6
+ * fd, or -1 if the socket is invalid. Used by CSocks5Proxy for non-blocking
+ * handshake I/O.
+ *
+ * @ingroup Network-General
+ *
+ * @param sock Socket to inspect.
+ * @return Raw fd, or -1.
+ */
+int net_socket_fd(NETSOCKET sock);
+
+/**
+ * @defgroup Network-SOCKS5 SOCKS5 Proxy Hooks
+ *
+ * @ingroup Network
+ *
+ * Optional client-side hooks that redirect all UDP traffic through a SOCKS5
+ * UDP relay. When a send/recv hook is installed (non-null), net_udp_send /
+ * net_udp_recv call it instead of performing the normal direct sendto/recvfrom.
+ * Used by CSocks5Proxy (engine/client/socks5_proxy.h).
+ *
+ * @{
+ */
+
+/**
+ * Send hook: wrap pDst/pData/Size in a SOCKS5 UDP header and send to the relay.
+ * Returns bytes of payload sent, or -1 on error.
+ *
+ * @ingroup Network-SOCKS5
+ */
+typedef int (*SOCKS5_UDP_SEND_HOOK)(const NETADDR *pDst, const void *pData, int Size);
+
+/**
+ * Recv hook: read one packet from the relay, unwrap the SOCKS5 UDP header,
+ * fill *pSrc with the real source address and *ppData with a pointer to a
+ * stable payload buffer. Returns payload bytes, or 0 if no data.
+ *
+ * @ingroup Network-SOCKS5
+ */
+typedef int (*SOCKS5_UDP_RECV_HOOK)(NETADDR *pSrc, unsigned char **ppData);
+
+/**
+ * Install or remove (pass nullptrs) the global SOCKS5 UDP intercept hooks.
+ *
+ * @ingroup Network-SOCKS5
+ */
+void net_set_socks5_hooks(SOCKS5_UDP_SEND_HOOK pSend, SOCKS5_UDP_RECV_HOOK pRecv);
+
+/**
+ * Direct (no-hook) variant of net_udp_send. Used by the SOCKS5 proxy to send
+ * to its relay socket without recursing back through the installed hook.
+ *
+ * @ingroup Network-SOCKS5
+ */
+int net_udp_send_direct(NETSOCKET sock, const NETADDR *addr, const void *data, int size);
+
+/**
+ * Direct (no-hook) variant of net_udp_recv.
+ *
+ * @ingroup Network-SOCKS5
+ */
+int net_udp_recv_direct(NETSOCKET sock, NETADDR *addr, unsigned char **data);
+
+/** @} */
+
 #if defined(CONF_FAMILY_UNIX)
 /**
  * @defgroup Network-Unix-Sockets UNIX Sockets

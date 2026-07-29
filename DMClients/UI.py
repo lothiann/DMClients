@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 _global_names = []
 _global_dictionary = []
 _show_advanced_logs = False
-_VERSION = "v8fix"
+_VERSION = "v9"
 
 _main_loop: asyncio.AbstractEventLoop | None = None
 
@@ -775,28 +775,23 @@ class ServerProcessManager:
         control_server.running = True
         bridge_receiver.running = True
 
-# ========== HDDNet CLIENT MANAGER ==========
-class HDDNetClientManager:
+# ========== DDNet CLIENT MANAGER ==========
+class DDNetClientManager:
     def __init__(self, log_callback):
         self.log_callback = log_callback
         self.processes: Dict[int, subprocess.Popen] = {}
         self.log_threads: Dict[int, threading.Thread] = {}
         self.log_flags: Dict[int, bool] = {}
         self.lock = threading.Lock()
-        self.base_dir = os.path.join(os.path.dirname(__file__), "DDNets-19.9-win64")
+        self.base_dir = os.path.join(os.path.dirname(__file__), "DDNet-19.9-win64")
         self.client_log: Dict[int, str] = {}
 
     def _get_exe_path(self, client_id: int) -> Optional[str]:
-        exe_name = f"HDDNet{client_id}.exe"
+        exe_name = "DDNet.exe"
         path = os.path.join(self.base_dir, exe_name)
         if os.path.exists(path):
             return path
-        pattern = os.path.join(self.base_dir, "HDDNet*.exe")
-        files = glob.glob(pattern)
-        if files:
-            self.log_callback(f"⚠️ {path} not found, using {files[0]}")
-            return files[0]
-        self.log_callback(f"❌ No HDDNet executable found in {self.base_dir}")
+        self.log_callback(f"❌ DDNet.exe not found in {self.base_dir}")
         return None
 
     def _log(self, msg: str):
@@ -1952,7 +1947,7 @@ class DMClientsApp:
         self.cmd_saved_input = ""
 
         self.control_server = ControlServer()
-        self.client_manager = HDDNetClientManager(self.add_log)
+        self.client_manager = DDNetClientManager(self.add_log)
         self.control_server.set_log_callback(self.add_log)
 
         self.bridge_receiver = BridgeReceiver()
@@ -2028,7 +2023,6 @@ class DMClientsApp:
 
         self.add_semicolons = True
         self.show_proxy_logs = True
-        self.show_proxifyre_logs = False
 
         self.prev_attack_tick: Dict[int, int] = {}
         self._config_timer: Optional[asyncio.Task] = None
@@ -2052,7 +2046,6 @@ class DMClientsApp:
 
         self.optimal_proxies_proc = None
         self.ports_proxies_proc = None
-        self.proxifyre_proc = None
 
         self._build_ui()
         self._start_monitoring()
@@ -2065,35 +2058,52 @@ class DMClientsApp:
             if c.name().lower() == 'flet.exe':
                 c.nice(psutil.REALTIME_PRIORITY_CLASS)
 
+    # Log batching: collect lines in _log_buffer (list), flush every 100ms.
+    # This prevents UI freezes when hundreds of log lines arrive per second
+    # (e.g. during proxy testing or stresser threads).
+    _log_buffer: list = []
+    _log_flush_pending: bool = False
+
     def add_log(self, text: str):
-        async def _do():
-            try:
-                lines = self._log_text.value.split('\n') if self._log_text.value else []
-                lines.append(text)
-                if len(lines) > self.MAX_LOG_LINES:
-                    lines = lines[-self.MAX_LOG_LINES:]
-
-                self._log_text.value = '\n'.join(lines)
-
-                if not self.console_container.visible:
-                    return
-
-                self._log_text.update()
-
-                if self._auto_scroll:
-                    await asyncio.sleep(0.02)
-                    try:
-                        await self.log_box.scroll_to(offset=-1, duration=0)
-                    except Exception:
-                        pass
-            except Exception:
-                pass  # Prevent log errors from crashing
-
+        """Thread-safe log append. Lines are batched and flushed every 100ms."""
         if self._loop is None or self._loop.is_closed():
             return
         try:
-            self._loop.call_soon_threadsafe(lambda: asyncio.create_task(_do()))
-        except RuntimeError:
+            self._log_buffer.append(text)
+        except AttributeError:
+            # Init time: _log_buffer may not exist yet
+            self._log_buffer = [text]
+        # Schedule a flush if one isn't already pending
+        if not self._log_flush_pending:
+            self._log_flush_pending = True
+            try:
+                self._loop.call_later(0.1, self._flush_logs)
+            except RuntimeError:
+                pass
+
+    def _flush_logs(self):
+        """Called on the UI thread by call_later. Drains _log_buffer into _log_text."""
+        self._log_flush_pending = False
+        try:
+            if not self._log_buffer:
+                return
+            new_lines = self._log_buffer
+            self._log_buffer = []
+            existing = self._log_text.value.split('\n') if self._log_text.value else []
+            existing.extend(new_lines)
+            if len(existing) > self.MAX_LOG_LINES:
+                existing = existing[-self.MAX_LOG_LINES:]
+            self._log_text.value = '\n'.join(existing)
+            if self.console_container.visible:
+                self._log_text.update()
+                if self._auto_scroll:
+                    # scroll_to is a coroutine — schedule it as a task to avoid
+                    # 'coroutine was never awaited' RuntimeWarning.
+                    try:
+                        asyncio.create_task(self.log_box.scroll_to(offset=-1, duration=0))
+                    except Exception:
+                        pass
+        except Exception:
             pass
 
     def _on_scroll(self, e: ft.OnScrollEvent):
@@ -2213,6 +2223,10 @@ class DMClientsApp:
                 synced += 1
                 if _show_advanced_logs:
                     self.add_log(f"🔗 Synced: Client #{client_id} → Control #{cid} ↔ Bridge #{bridge_cidx}")
+                # If proxies are active, tell this freshly-synced client to route through its SOCKS5 proxy.
+                if self._proxies_active():
+                    port = self._get_proxy_port_for_client(client_id)
+                    self._send_command_to_ddnet_id(client_id, f"c_proxy 1 127.0.0.1:{port}")
 
         return synced
 
@@ -2408,85 +2422,57 @@ class DMClientsApp:
             self.add_log("⚠️ Clients per proxy must be a positive integer")
             return
 
-        if new_count == self.NUM_CLIENTS:
-            self._generate_proxifyre_config(new_count, cpp)
-            self.add_log(f"🔄 Config regenerated with {cpp} clients per proxy (count unchanged)")
+        try:
+            proxy_limit = int(self.proxy_limit_field.value.strip())
+            if proxy_limit < 1:
+                raise ValueError
+            self.PROXY_LIMIT = proxy_limit
+        except ValueError:
+            self.add_log("⚠️ Proxy limit must be a positive integer")
             return
 
-        self.client_manager.stop_all()
-        time.sleep(0.5)
-
-        base_dir = os.path.join(os.path.dirname(__file__), "DDNets-19.9-win64")
-        template = os.path.join(base_dir, "HDDNet1.exe")
-        if not os.path.isfile(template):
-            self.add_log("❌ HDDNet1.exe not found")
+        # Persist num_clients + clients_per_proxy + proxy_limit to Settings/proxies.json
+        proxies_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
+        try:
+            data = {}
+            if os.path.exists(proxies_path):
+                with open(proxies_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            if "settings" not in data or not isinstance(data["settings"], dict):
+                data["settings"] = {}
+            data["settings"]["num_clients"] = new_count
+            data["settings"]["clients_per_proxy"] = cpp
+            data["settings"]["proxy_limit"] = self.PROXY_LIMIT
+            with open(proxies_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as ex:
+            self.add_log(f"❌ Failed to save proxies.json: {ex}")
             return
 
-        for f in glob.glob(os.path.join(base_dir, "HDDNet*.exe")):
-            if os.path.basename(f) != "HDDNet1.exe":
-                os.remove(f)
-
-        for i in range(2, new_count + 1):
-            dest = os.path.join(base_dir, f"HDDNet{i}.exe")
-            shutil.copy(template, dest)
-
-        self._generate_proxifyre_config(new_count, cpp)
+        cpp_changed = cpp != self.clients_per_proxy
         self.NUM_CLIENTS = new_count
         self.clients_per_proxy = cpp
         self._rebuild_clients_table()
-        self.add_log(f"🔄 Applied: {new_count} clients, {cpp} clients per proxy")
+        self.add_log(f"🔄 Applied: {new_count} clients, {cpp} clients per proxy, proxy_limit={self.PROXY_LIMIT}")
+
+        # If clients_per_proxy changed and proxies are active, re-send c_proxy to all synced clients
+        if cpp_changed and self._proxies_active():
+            self._resend_proxy_to_all_clients()
 
     def _detect_config(self):
-        base_dir = os.path.join(os.path.dirname(__file__), "DDNets-19.9-win64")
-        files = glob.glob(os.path.join(base_dir, "HDDNet*.exe"))
-    
-        max_id = 0
-        for f in files:
-            match = re.search(r'HDDNet(\d+)\.exe$', os.path.basename(f))
-            if match:
-                max_id = max(max_id, int(match.group(1)))
-        self.NUM_CLIENTS = max_id if max_id > 0 else 28
-    
-        config_path = os.path.join(os.path.dirname(__file__), "ProxiFyre", "app-config.json")
-        if os.path.exists(config_path):
+        """Read num_clients, clients_per_proxy and proxy_limit from Settings/proxies.json."""
+        proxies_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
+        settings = {}
+        if os.path.exists(proxies_path):
             try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    config = json.load(f)
-                proxies = config.get("proxies", [])
-                if proxies and "appNames" in proxies[0]:
-                    app_count = len(proxies[0]["appNames"])
-                    self.clients_per_proxy = app_count // 2
-                else:
-                    self.clients_per_proxy = 2
-            except:
-                self.clients_per_proxy = 2
-        else:
-            self.clients_per_proxy = 2
-
-    def _generate_proxifyre_config(self, num_clients: int, clients_per_proxy: int = None):
-        if clients_per_proxy is None:
-            clients_per_proxy = self.clients_per_proxy
-        proxy_count = (num_clients + clients_per_proxy - 1) // clients_per_proxy
-        proxies = []
-        for proxy_idx in range(1, proxy_count + 1):
-            start_id = (proxy_idx - 1) * clients_per_proxy + 1
-            end_id = min(proxy_idx * clients_per_proxy, num_clients)
-            app_names = []
-            for cid in range(start_id, end_id + 1):
-                app_names.append(f"ddnet{cid}.exe")
-                app_names.append(f"hddnet{cid}.exe")
-            port = 10800 + proxy_idx
-            proxies.append({
-                "appNames": app_names,
-                "socks5ProxyEndpoint": f"127.0.0.1:{port}",
-                "supportedProtocols": ["TCP", "UDP"]
-            })
-        config = {"logLevel": "Error", "proxies": proxies}
-        config_path = os.path.join(os.path.dirname(__file__), "ProxiFyre", "app-config.json")
-        os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        with open(config_path, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
-        self.add_log(f"📄 app-config.json regenerated: {proxy_count} proxies, {clients_per_proxy} clients each")
+                with open(proxies_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                settings = data.get("settings", {}) or {}
+            except Exception:
+                pass
+        self.NUM_CLIENTS = settings.get("num_clients", 28)
+        self.clients_per_proxy = settings.get("clients_per_proxy", 2)
+        self.PROXY_LIMIT = settings.get("proxy_limit", 14)
 
     def _load_spare_proxies(self):
         spare_path = os.path.join(os.path.dirname(__file__), "Settings", "spare_proxies.json")
@@ -2515,17 +2501,24 @@ class DMClientsApp:
             return
         new_key = self.spare_proxies.pop(0)
         self._save_spare_proxies()
-        json_path = os.path.join(os.path.dirname(sys.executable), "Settings", "proxies.json")
+        json_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            for item in data:
-                if item["port"] == port:
-                    item["key"] = new_key
-                    break
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            self.add_log(f"✅ Key for port {port} replaced")
+            # New format: {"settings": {...}, "proxies": [key1, key2, ...]}
+            proxies_list = data.get("proxies", []) if isinstance(data, dict) else data
+            idx = port - self.PROXY_BASE_PORT
+            if 0 <= idx < len(proxies_list):
+                proxies_list[idx] = new_key
+                if isinstance(data, dict):
+                    data["proxies"] = proxies_list
+                else:
+                    data = proxies_list
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                self.add_log(f"✅ Key for port {port} (index {idx}) replaced")
+            else:
+                self.add_log(f"❌ Port {port} out of range (index {idx})")
             if hasattr(self, 'spare_label'):
                 self.spare_label.value = f"Spare proxies: {len(self.spare_proxies)}"
                 self.spare_label.update()
@@ -3296,7 +3289,6 @@ class DMClientsApp:
     def _build_settings_ui(self):
         semicolon_switch = ft.Switch(label='Adding ";" in commands', value=True, on_change=self.on_semicolon_switch_change)
         proxy_logs_cb = ft.Checkbox(label="Show Proxy logs", value=self.show_proxy_logs, on_change=self.on_proxy_logs_change)
-        proxifyre_logs_cb = ft.Checkbox(label="Show ProxiFyre logs", value=self.show_proxifyre_logs, on_change=self.on_proxifyre_logs_change)
         self.advanced_logs_cb = ft.Checkbox(
             label="Advanced logs",
             value=False,
@@ -3309,6 +3301,9 @@ class DMClientsApp:
                                 style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8))),
                 ft.FilledButton("Fast proxies", icon=ft.Icons.FLASH_ON, on_click=self.fast_proxies,
                         style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8))),
+                ft.FilledButton("Check Proxy", icon=ft.Icons.FACT_CHECK, on_click=self._check_proxies,
+                                style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8)),
+                                tooltip="Test all proxies in proxies.json and save best N to checked_proxies.json"),
                 ft.FilledButton("Start Proxies", icon=ft.Icons.PLAY_ARROW, on_click=self.toggle_proxies,
                                 style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8)))
             ], spacing=10),
@@ -3319,18 +3314,22 @@ class DMClientsApp:
             on_click=self.toggle_all_clients,
             style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8))
         )
-        block2 = ft.Container(content=self.all_clients_btn, padding=10, bgcolor="#1a1a24", border_radius=10)
+        sync_btn = ft.FilledButton("Sync clients", icon=ft.Icons.SYNC, on_click=self.sync_clients,
+                            style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8)))
+        block2 = ft.Container(
+            content=ft.Row([self.all_clients_btn, sync_btn], spacing=10),
+            padding=10, bgcolor="#1a1a24", border_radius=10
+        )
         block3 = ft.Container(
             content=ft.FilledButton("Clear logs", icon=ft.Icons.DELETE, on_click=lambda e: self.clear_logs(),
                                     style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8))),
             padding=10, bgcolor="#1a1a24", border_radius=10
         )
-        block4 = ft.Container(
-            content=ft.FilledButton("Sync clients", icon=ft.Icons.SYNC, on_click=self.sync_clients,
-                                    style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white", shape=ft.RoundedRectangleBorder(radius=8))),
-            padding=10, bgcolor="#1a1a24", border_radius=10
-        )
-        top_row = ft.Row([block1, block2, block3, block4], alignment=ft.MainAxisAlignment.START, spacing=10)
+        # Two rows: row 1 = proxy buttons + clear logs, row 2 = clients + sync
+        top_row = ft.Column([
+            ft.Row([block1, block3], alignment=ft.MainAxisAlignment.START, spacing=10),
+            ft.Row([block2], alignment=ft.MainAxisAlignment.START, spacing=10),
+        ], spacing=10)
 
         self.fix_players_switch = ft.Switch(label="Try to fix player loading", value=False, on_change=self.on_fix_players_toggle)
         self.timeout_reconnect_switch = ft.Switch(label="Timeout reconnect", value=False, on_change=self.on_timeout_reconnect_toggle)
@@ -3339,21 +3338,30 @@ class DMClientsApp:
                                               bgcolor="#1e1e24", border_color="#33334d")
         self.clients_per_proxy_field = ft.TextField(label="Clients per proxy", value=str(self.clients_per_proxy), width=120,
                                                     bgcolor="#1e1e24", border_color="#33334d")
+        self.proxy_limit_field = ft.TextField(label="Proxy limit", value=str(getattr(self, "PROXY_LIMIT", 14)), width=100,
+                                              bgcolor="#1e1e24", border_color="#33334d", tooltip="How many proxies to keep in proxies.json (the pool)")
         self.apply_clients_btn = ft.FilledButton("Apply", icon=ft.Icons.CHECK, on_click=self._apply_client_count,
                                                  style=ft.ButtonStyle(bgcolor="#2a2a3a", color="white"))
         self.spare_proxies_switch = ft.Switch(value=False, label="Use spare proxies")
         self.spare_count_field = ft.TextField(label="Spare count", value="5", width=80,
                                               bgcolor="#1e1e24", border_color="#33334d")
-        self.target_server_field = ft.TextField(label="Target server", value="45.141.57.22:8390", width=200,
-                                                bgcolor="#1e1e24", border_color="#33334d", tooltip="The server on which to check the proxy")
+        self.target_server_field = ft.TextField(label="Target servers", value="45.141.57.22:8390,46.174.54.240:8406,46.174.54.240:8451,46.174.54.240:8360", width=300,
+                                                bgcolor="#1e1e24", border_color="#33334d", tooltip="Comma-separated list of DDNet servers to test proxy against (e.g. 1.2.3.4:8305,5.6.7.8:8305). A random one is picked each run.")
         self.timeout_field = ft.TextField(label="Timeout (ms)", value="5000", width=120,
                                           bgcolor="#1e1e24", border_color="#33334d", tooltip="Ping/IP check timeout in ms")
+        self.threads_field = ft.TextField(label="Threads", value="100", width=90,
+                                          bgcolor="#1e1e24", border_color="#33334d", tooltip="MAX_WORKERS for proxy testing")
+        self.ddnet_test_switch = ft.Switch(label="Test in DDNet", value=True, tooltip="Validate proxies by connecting to DDNet server")
+        self.banned_filter_switch = ft.Switch(label="Banned Filter", value=True, tooltip="When ON, skip proxies whose exit IP is in bproxies.json. When OFF, banned IPs are still recorded but not filtered — useful for servers without IP-based protection.")
 
         try:
-            with open("optimal_proxies_new.py", "r", encoding="utf-8") as f:
+            with open("optimal_proxies.py", "r", encoding="utf-8") as f:
                 content = f.read()
             import re
-            match = re.search(r'TARGET_SERVER\s*=\s*["\']([^"\']+)["\']', content)
+            # Prefer TARGET_SERVERS (comma-separated); fallback to single TARGET_SERVER.
+            match = re.search(r'TARGET_SERVERS\s*=\s*["\']([^"\']+)["\']', content)
+            if not match:
+                match = re.search(r'TARGET_SERVER\s*=\s*["\']([^"\']+)["\']', content)
             if match:
                 self.target_server_field.value = match.group(1)
                 self.target_server_field.update()
@@ -3366,12 +3374,13 @@ class DMClientsApp:
                         self.fix_players_switch,
                         self.timeout_reconnect_switch,
                         self.generate_timeout_code_btn], spacing=10),
-                ft.Row([proxy_logs_cb, proxifyre_logs_cb, self.advanced_logs_cb], spacing=20),
+                ft.Row([proxy_logs_cb, self.advanced_logs_cb], spacing=20),
                 ft.Row([
                     ft.Text("Set client count:", size=14),
-                    self.num_clients_field, self.clients_per_proxy_field, self.apply_clients_btn,
+                    self.num_clients_field, self.clients_per_proxy_field, self.proxy_limit_field, self.apply_clients_btn,
                 ], spacing=10),
-                ft.Row([self.spare_proxies_switch, self.spare_count_field, self.target_server_field, self.timeout_field], spacing=10),
+                ft.Row([self.spare_proxies_switch, self.spare_count_field, self.target_server_field, self.timeout_field, self.threads_field], spacing=10),
+                ft.Row([self.ddnet_test_switch, self.banned_filter_switch], spacing=20),
             ], spacing=10),
             padding=10, bgcolor="#1a1a24", border_radius=10
         )
@@ -3449,9 +3458,10 @@ class DMClientsApp:
             try:
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                for item in data:
-                    port = item["port"]
-                    key = item["key"]
+                # New format: {"settings": {...}, "proxies": [key1, key2, ...]}
+                proxies_list = data.get("proxies", []) if isinstance(data, dict) else data
+                for idx, key in enumerate(proxies_list):
+                    port = self.PROXY_BASE_PORT + idx
                     key_preview = key.split("#")[0][:50]
                     replace_btn = ft.FilledButton("Replace", icon=ft.Icons.REFRESH,
                                                   on_click=lambda e, p=port: self._replace_proxy(p), width=200,
@@ -3972,45 +3982,72 @@ class DMClientsApp:
                 button.icon = ft.Icons.PLAY_ARROW
         button.update()
 
-    def toggle_all_clients(self, e):
-        running_count = sum(1 for i in range(1, self.NUM_CLIENTS + 1) if self.client_manager.is_running(i))
-        if running_count == self.NUM_CLIENTS:
-            self.client_manager.stop_all()
-            for i in range(1, self.NUM_CLIENTS + 1):
-                self.control_server.remove_client(i)
-            for btn in self.connect_buttons:
+    def _set_btn_state(self, idx: int, running: bool):
+        """Update a single connect button's label/icon (called on UI thread)."""
+        try:
+            btn = self.connect_buttons[idx - 1]
+            if running:
+                btn.content = ft.Text("Disconnect")
+                btn.icon = ft.Icons.STOP
+            else:
                 btn.content = ft.Text("Connect")
                 btn.icon = ft.Icons.PLAY_ARROW
-                btn.update()
-                time.sleep(0.1)
-            self.all_clients_btn.content = ft.Text("Start all clients")
-            self.all_clients_btn.icon = ft.Icons.PLAY_ARROW
-        else:
-            def launch_with_delay():
-                started = 0
-                for i in range(1, self.NUM_CLIENTS + 1):
-                    if not self.client_manager.is_running(i):
-                        show_logs = self.logs_checkboxes[i - 1].value if i - 1 < len(self.logs_checkboxes) else True
-                        if self.client_manager.launch(i, show_logs):
-                            self.connect_buttons[i - 1].content = ft.Text("Disconnect")
-                            self.connect_buttons[i - 1].icon = ft.Icons.STOP
-                            self._loop.call_soon_threadsafe(self.connect_buttons[i - 1].update)
-                            self._loop.call_soon_threadsafe(self.page.update)
-                            started += 1
-                        time.sleep(0.1)
-                new_running = sum(1 for i in range(1, self.NUM_CLIENTS + 1) if self.client_manager.is_running(i))
-                if new_running == self.NUM_CLIENTS:
-                    self._loop.call_soon_threadsafe(lambda: setattr(self.all_clients_btn, 'content', ft.Text("Stop all clients")))
-                    self._loop.call_soon_threadsafe(lambda: setattr(self.all_clients_btn, 'icon', ft.Icons.STOP))
+            btn.update()
+        except Exception:
+            pass
+
+    def toggle_all_clients(self, e):
+        """Toggle all clients based on actual running count (not XOR).
+
+        - If any client is NOT running -> Start all (button switches to Stop).
+        - If all clients ARE running -> Stop all (button switches to Start).
+        Both branches run in a worker thread so the UI never blocks on time.sleep().
+        """
+        running_count = sum(1 for i in range(1, self.NUM_CLIENTS + 1) if self.client_manager.is_running(i))
+        should_start = running_count < self.NUM_CLIENTS
+
+        def _refresh_button_state():
+            """Update all_clients_btn label/icon based on current running count."""
+            n = sum(1 for i in range(1, self.NUM_CLIENTS + 1) if self.client_manager.is_running(i))
+            if n == self.NUM_CLIENTS:
+                self.all_clients_btn.content = ft.Text("Stop all clients")
+                self.all_clients_btn.icon = ft.Icons.STOP
+            else:
+                self.all_clients_btn.content = ft.Text("Start all clients")
+                self.all_clients_btn.icon = ft.Icons.PLAY_ARROW
+            try:
+                self.all_clients_btn.update()
+                self.page.update()
+            except Exception:
+                pass
+
+        def _worker():
+            try:
+                if should_start:
+                    for i in range(1, self.NUM_CLIENTS + 1):
+                        if not self.client_manager.is_running(i):
+                            show_logs = self.logs_checkboxes[i - 1].value if i - 1 < len(self.logs_checkboxes) else True
+                            if self.client_manager.launch(i, show_logs):
+                                self._loop.call_soon_threadsafe(lambda idx=i: self._set_btn_state(idx, True))
+                            time.sleep(0.1)
+                else:
+                    self.client_manager.stop_all()
+                    for i in range(1, self.NUM_CLIENTS + 1):
+                        self.control_server.remove_client(i)
+                        self._loop.call_soon_threadsafe(lambda idx=i: self._set_btn_state(idx, False))
+                        time.sleep(0.05)
+            finally:
+                self._loop.call_soon_threadsafe(_refresh_button_state)
                 self._loop.call_soon_threadsafe(self.update_clients_stats)
                 self._loop.call_soon_threadsafe(self.page.update)
 
-            try:
-                asyncio.create_task(asyncio.to_thread(launch_with_delay))
-            except RuntimeError:
-                self.add_log("❌ Failed to start clients: no event loop")
+        try:
+            asyncio.create_task(asyncio.to_thread(_worker))
+        except RuntimeError:
+            self.add_log("❌ Failed to toggle clients: no event loop")
 
-        self.all_clients_btn.update()
+        # Optimistic update — actual state will be reconciled by _worker finally block.
+        _refresh_button_state()
         self.update_clients_stats()
         self.clients_table.update()
 
@@ -4055,55 +4092,62 @@ class DMClientsApp:
                 target_y = data.get('target_y', 0)
                 aim_str = f"{target_x},{target_y}"
             
-                def make_checkbox(p_id, current_val):
-                    def on_change(e):
-                        if self.all_target_cb.value:
-                            untarget_ids = set()
-                            current = self.attack_target_field.value.strip()
-                            if current and current != "-1":
-                                for part in current.split(','):
-                                    try:
-                                        untarget_ids.add(int(part.strip()))
-                                    except:
-                                        pass
-                            if e.control.value:
-                                untarget_ids.add(p_id)
+                # Reuse checkbox if we already built one for this pid; only build for new pids.
+                if pid in self.target_checkboxes:
+                    cb = self.target_checkboxes[pid]
+                    # Sync value silently
+                    if cb.value != (pid in current_targets):
+                        cb.value = pid in current_targets
+                else:
+                    def make_checkbox(p_id, current_val):
+                        def on_change(e):
+                            if self.all_target_cb.value:
+                                untarget_ids = set()
+                                current = self.attack_target_field.value.strip()
+                                if current and current != "-1":
+                                    for part in current.split(','):
+                                        try:
+                                            untarget_ids.add(int(part.strip()))
+                                        except:
+                                            pass
+                                if e.control.value:
+                                    untarget_ids.add(p_id)
+                                else:
+                                    untarget_ids.discard(p_id)
+                                if untarget_ids:
+                                    new_value = ','.join(str(i) for i in sorted(untarget_ids))
+                                else:
+                                    new_value = "-1"
+                                self.attack_target_field.value = new_value
                             else:
-                                untarget_ids.discard(p_id)
-                            if untarget_ids:
-                                new_value = ','.join(str(i) for i in sorted(untarget_ids))
-                            else:
-                                new_value = "-1"
-                            self.attack_target_field.value = new_value
-                        else:
-                            target_ids = set()
-                            current = self.attack_target_field.value.strip()
-                            if current:
-                                for part in current.split(','):
-                                    try:
-                                        target_ids.add(int(part.strip()))
-                                    except:
-                                        pass
-                            if e.control.value:
-                                target_ids.add(p_id)
-                            else:
-                                target_ids.discard(p_id)
-                            if target_ids:
-                                new_value = ','.join(str(i) for i in sorted(target_ids))
-                            else:
-                                new_value = ""
-                            self.attack_target_field.value = new_value
+                                target_ids = set()
+                                current = self.attack_target_field.value.strip()
+                                if current:
+                                    for part in current.split(','):
+                                        try:
+                                            target_ids.add(int(part.strip()))
+                                        except:
+                                            pass
+                                if e.control.value:
+                                    target_ids.add(p_id)
+                                else:
+                                    target_ids.discard(p_id)
+                                if target_ids:
+                                    new_value = ','.join(str(i) for i in sorted(target_ids))
+                                else:
+                                    new_value = ""
+                                self.attack_target_field.value = new_value
         
-                        self.attack_target_field.update()
-                        self._schedule_attack_config_update()
+                            self.attack_target_field.update()
+                            self._schedule_attack_config_update()
     
-                    return on_change
+                        return on_change
             
-                cb = ft.Checkbox(
-                    value=pid in current_targets,
-                    on_change=make_checkbox(pid, pid in current_targets)
-                )
-                self.target_checkboxes[pid] = cb
+                    cb = ft.Checkbox(
+                        value=pid in current_targets,
+                        on_change=make_checkbox(pid, pid in current_targets)
+                    )
+                    self.target_checkboxes[pid] = cb
             
                 rows.append(ft.DataRow(cells=[
                     ft.DataCell(ft.Text(data.get('name', '')[:20])),
@@ -4140,9 +4184,6 @@ class DMClientsApp:
     def on_proxy_logs_change(self, e):
         self.show_proxy_logs = e.control.value
 
-    def on_proxifyre_logs_change(self, e):
-        self.show_proxifyre_logs = e.control.value
-
     def on_nav_change(self, e):
         idx = e.control.selected_index
         self.console_container.visible = False
@@ -4172,11 +4213,11 @@ class DMClientsApp:
 
     def run_optimal_proxies(self):
         self.switch_to_console()
-        self.add_log("🔍 Starting proxy selection (optimal_proxies_new.py)...")
+        self.add_log("🔍 Starting proxy selection (optimal_proxies.py)...")
         if hasattr(self, 'optimal_proxies_proc') and self.optimal_proxies_proc and self.optimal_proxies_proc.poll() is None:
             self.add_log("⚠️ Proxy selection already running")
             return
-        script_path = os.path.join(os.path.dirname(__file__), "optimal_proxies_new.py")
+        script_path = os.path.join(os.path.dirname(__file__), "optimal_proxies.py")
         if not os.path.exists(script_path):
             self.add_log(f"❌ File {script_path} not found")
             return
@@ -4185,16 +4226,24 @@ class DMClientsApp:
             self._server_mgr.pause(self.control_server, self.bridge_receiver)
             self.add_log("⏸️ Servers paused for proxy selection (ports freed)")
         cmd = [sys.executable, "-u", script_path]
-        target = self.target_server_field.value.strip()
+        targets = self.target_server_field.value.strip()
         count = self.spare_count_field.value.strip() or "5"
         timeout = self.timeout_field.value.strip() or "5000"
-        if target:
-            cmd.append(f"--target-server={target}")
+        if targets:
+            cmd.append(f"--target-servers={targets}")
         if self.spare_proxies_switch.value:
             cmd.append(f"--spare-proxies={count}")
         if timeout:
             cmd.append(f"--timeout={timeout}")
-        top_n = (self.NUM_CLIENTS + self.clients_per_proxy - 1) // self.clients_per_proxy
+        threads = self.threads_field.value.strip() or "100"
+        if threads:
+            cmd.append(f"--threads={threads}")
+        if not self.ddnet_test_switch.value:
+            cmd.append("--skip-ddnet")
+        cmd.append(f"--banned-filter={'true' if self.banned_filter_switch.value else 'false'}")
+        # Pool size for proxies.json — PROXY_LIMIT (NOT ceil(NUM_CLIENTS/cpp),
+        # which is now used by Check Proxy to filter checked_proxies.json).
+        top_n = max(1, getattr(self, 'PROXY_LIMIT', 14))
         cmd.append(f"--top-n={top_n}")
         if self.spare_proxies_switch.value:
             count = self.spare_count_field.value.strip() or "5"
@@ -4237,71 +4286,16 @@ class DMClientsApp:
             self.add_log("❌ Failed to start output reader")
 
     # ========== PROXY HELPERS ==========
-    def _decode_vmess_base64(self, key: str) -> str:
-        if not key.startswith("vmess://"):
-            return key
-        payload = key[len("vmess://"):]
-        if not payload:
-            return key
-        try:
-            import base64
-            padded = payload + "=" * (-len(payload) % 4)
-            decoded = base64.b64decode(padded).decode("utf-8", errors="ignore")
-            obj = json.loads(decoded)
-            if not isinstance(obj, dict):
-                return key
-            add = obj.get("add", "")
-            port = obj.get("port", "")
-            uid = obj.get("id", "")
-            net = obj.get("net", "tcp")
-            ttype = obj.get("type", "none")
-            host = obj.get("host", "")
-            path = obj.get("path", "")
-            tls = obj.get("tls", "")
-            sni = obj.get("sni", "")
-            alpn = obj.get("alpn", "")
-            fp = obj.get("fp", "")
-            pbk = obj.get("pbk", "")
-            sid = obj.get("sid", "")
-            flow = obj.get("flow", "")
-            scy = obj.get("scy", "auto")
-
-            if not add or not port or not uid:
-                return key
-
-            params = [f"type={net}"]
-            if ttype and ttype != "none":
-                params.append(f"headerType={ttype}")
-            if host:
-                params.append(f"host={host}")
-            if path:
-                params.append(f"path={path}")
-            params.append(f"security={tls}" if tls else "security=none")
-            if sni:
-                params.append(f"sni={sni}")
-            if alpn:
-                params.append(f"alpn={alpn}")
-            if fp:
-                params.append(f"fp={fp}")
-            if pbk:
-                params.append(f"pbk={pbk}")
-            if sid:
-                params.append(f"sid={sid}")
-            if flow:
-                params.append(f"flow={flow}")
-            if scy and scy != "auto":
-                params.append(f"encryption={scy}")
-
-            query = "&".join(params)
-            remark = obj.get("ps", "")
-            fragment = f"#{remark}" if remark else ""
-            return f"vmess://{uid}@{add}:{port}?{query}{fragment}"
-        except Exception:
-            return key
-
     def _parse_key_to_config(self, key: str) -> dict | None:
+        """Parse a proxy key into an xray outbound config dict.
+
+        Uses python_v2ray.XrayConfigBuilder for vless/vmess/trojan/ss/socks so
+        that streamSettings are built correctly for every transport (TCP
+        headerType, REALITY, WS, gRPC, KCP, ...). Falls back to manual
+        construction for hysteria/hysteria2/wireguard.
+        """
         try:
-            from python_v2ray.config_parser import parse_uri
+            from python_v2ray.config_parser import parse_uri, XrayConfigBuilder
 
             k = key
             if k.startswith("socks5://"):
@@ -4313,232 +4307,64 @@ class DMClientsApp:
             elif k.startswith("hy2://"):
                 k = "hysteria2://" + k[len("hy2://"):]
 
-            if k.startswith("vmess://"):
-                k = self._decode_vmess_base64(k)
-
             p = parse_uri(k)
-            server = getattr(p, 'address', None) or getattr(p, 'server', None) or getattr(p, 'host', None)
+            if p is None:
+                return None
+
+            server = getattr(p, "address", None) or getattr(p, "server", None)
             if not server:
                 return None
 
-            # ---------- VLESS / VMESS ----------
-            if p.protocol in ('vless', 'vmess'):
-                ob = {
-                    "protocol": p.protocol,
-                    "settings": {"vnext": [{"address": server, "port": p.port,
-                        "users": [{"id": getattr(p, 'id', getattr(p, 'uuid', '')),
-                                   "encryption": getattr(p, 'encryption', 'none'),
-                                   "flow": getattr(p, 'flow', '')}]}]},
-                    "streamSettings": {"network": getattr(p, 'network', 'tcp'),
-                                       "security": getattr(p, 'security', 'none')}
-                }
-                network = ob["streamSettings"]["network"]
-                security = ob["streamSettings"]["security"]
+            # ----- Protocols supported by XrayConfigBuilder -----
+            if p.protocol in ("vless", "mvless", "vmess", "trojan", "ss", "shadowsocks", "socks"):
+                builder = XrayConfigBuilder()
+                outbound = builder.build_outbound_from_params(p)
+                if outbound:
+                    outbound.pop("tag", None)
+                    return outbound
 
-                if network == "ws":
-                    ws = {}
-                    if hasattr(p, "path"):
-                        ws["path"] = p.path
-                    if hasattr(p, "host"):
-                        ws["headers"] = {"Host": p.host}
-                    ob["streamSettings"]["wsSettings"] = ws
-                elif network == "grpc":
-                    grpc = {}
-                    if hasattr(p, "serviceName"):
-                        grpc["serviceName"] = p.serviceName
-                    if hasattr(p, "mode"):
-                        grpc["multiMode"] = p.mode == "multi"
-                    ob["streamSettings"]["grpcSettings"] = grpc
-                elif network == "http":
-                    http = {}
-                    if hasattr(p, "host"):
-                        http["host"] = [p.host] if isinstance(p.host, str) else p.host
-                    if hasattr(p, "path"):
-                        http["path"] = p.path
-                    ob["streamSettings"]["httpSettings"] = http
-                elif network == "kcp":
-                    kcp = {"congestion": True}
-                    if hasattr(p, "header"):
-                        kcp["header"] = {"type": p.header}
-                    elif hasattr(p, "headerType"):
-                        kcp["header"] = {"type": p.headerType}
-                    if hasattr(p, "seed"):
-                        kcp["seed"] = p.seed
-                    ob["streamSettings"]["kcpSettings"] = kcp
-                elif network == "quic":
-                    quic = {}
-                    if hasattr(p, "header"):
-                        quic["header"] = {"type": p.header}
-                    elif hasattr(p, "headerType"):
-                        quic["header"] = {"type": p.headerType}
-                    if hasattr(p, "quicSecurity"):
-                        quic["security"] = p.quicSecurity
-                    if hasattr(p, "key"):
-                        quic["key"] = p.key
-                    ob["streamSettings"]["quicSettings"] = quic
-
-                if security == "tls":
-                    tls_cfg = {"serverName": getattr(p, "sni", server),
-                               "allowInsecure": getattr(p, "allowInsecure", False)}
-                    if hasattr(p, "fingerprint"):
-                        tls_cfg["fingerprint"] = p.fingerprint
-                    if hasattr(p, "alpn"):
-                        alpn_val = p.alpn
-                        if isinstance(alpn_val, str):
-                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                        tls_cfg["alpn"] = alpn_val
-                    ob["streamSettings"]["tlsSettings"] = tls_cfg
-                elif security == "reality":
-                    reality_cfg = {
-                        "serverName": getattr(p, "sni", ""),
-                        "fingerprint": getattr(p, "fingerprint", "chrome"),
-                        "publicKey": getattr(p, "pbk", ""),
-                        "shortId": getattr(p, "sid", ""),
-                        "spiderX": getattr(p, "spiderX", "/")
-                    }
-                    if hasattr(p, "alpn"):
-                        alpn_val = p.alpn
-                        if isinstance(alpn_val, str):
-                            alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                        reality_cfg["alpn"] = alpn_val
-                    ob["streamSettings"]["realitySettings"] = reality_cfg
-                return ob
-
-            # ---------- Shadowsocks / SS ----------
-            if p.protocol in ('shadowsocks', 'ss'):
-                out = {
-                    "protocol": "shadowsocks",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "method": getattr(p, 'method', 'chacha20-ietf-poly1305'),
-                        "password": getattr(p, 'password', '')}]}
-                }
-                if hasattr(p, "plugin"):
-                    out["settings"]["servers"][0]["plugin"] = p.plugin
-                    if hasattr(p, "pluginOpts"):
-                        out["settings"]["servers"][0]["pluginOpts"] = p.pluginOpts
-                ss_network = getattr(p, "network", None)
-                if ss_network and ss_network != "tcp":
-                    out["streamSettings"] = {"network": ss_network}
-                    if ss_network == "ws":
-                        ws = {}
-                        if hasattr(p, "path"):
-                            ws["path"] = p.path
-                        if hasattr(p, "host"):
-                            ws["headers"] = {"Host": p.host}
-                        out["streamSettings"]["wsSettings"] = ws
-                return out
-
-            # ---------- Trojan ----------
-            if p.protocol == 'trojan':
-                network = getattr(p, "network", "tcp")
-                security = getattr(p, "security", "tls")
-                out = {
-                    "protocol": "trojan",
-                    "settings": {"servers": [{"address": server, "port": p.port,
-                        "password": getattr(p, 'password', getattr(p, 'uuid', ''))}]},
-                    "streamSettings": {"network": network, "security": security}
-                }
-                if security in ("tls", "reality"):
-                    if security == "tls":
-                        tls_cfg = {"serverName": getattr(p, "sni", server),
-                                   "allowInsecure": getattr(p, "allowInsecure", False)}
-                        if hasattr(p, "fingerprint"):
-                            tls_cfg["fingerprint"] = p.fingerprint
-                        if hasattr(p, "alpn"):
-                            alpn_val = p.alpn
-                            if isinstance(alpn_val, str):
-                                alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                            tls_cfg["alpn"] = alpn_val
-                        out["streamSettings"]["tlsSettings"] = tls_cfg
-                    elif security == "reality":
-                        out["streamSettings"]["realitySettings"] = {
-                            "serverName": getattr(p, "sni", ""),
-                            "fingerprint": getattr(p, "fingerprint", "chrome"),
-                            "publicKey": getattr(p, "pbk", ""),
-                            "shortId": getattr(p, "sid", ""),
-                            "spiderX": getattr(p, "spiderX", "/")
-                        }
-                if network == "ws":
-                    ws = {}
-                    if hasattr(p, "path"):
-                        ws["path"] = p.path
-                    if hasattr(p, "host"):
-                        ws["headers"] = {"Host": p.host}
-                    out["streamSettings"]["wsSettings"] = ws
-                elif network == "grpc":
-                    grpc = {}
-                    if hasattr(p, "serviceName"):
-                        grpc["serviceName"] = p.serviceName
-                    if hasattr(p, "mode"):
-                        grpc["multiMode"] = p.mode == "multi"
-                    out["streamSettings"]["grpcSettings"] = grpc
-                elif network == "kcp":
-                    kcp = {"congestion": True}
-                    if hasattr(p, "header"):
-                        kcp["header"] = {"type": p.header}
-                    elif hasattr(p, "headerType"):
-                        kcp["header"] = {"type": p.headerType}
-                    if hasattr(p, "seed"):
-                        kcp["seed"] = p.seed
-                    out["streamSettings"]["kcpSettings"] = kcp
-                return out
-
-            # ---------- Hysteria / Hysteria2 ----------
-            if p.protocol in ('hysteria', 'hysteria2'):
+            # ----- Hysteria / Hysteria2 (manual) -----
+            if p.protocol in ("hysteria", "hysteria2"):
                 out = {
                     "protocol": p.protocol,
                     "settings": {"servers": [{"address": server, "port": p.port,
-                        "password": getattr(p, 'password', getattr(p, 'auth', ''))}]},
+                        "password": getattr(p, "hy2_password", getattr(p, "password", ""))}]},
                     "streamSettings": {"network": "udp", "security": "tls",
-                        "tlsSettings": {"serverName": getattr(p, 'sni', server),
-                                        "allowInsecure": getattr(p, "allowInsecure", False)}}
+                        "tlsSettings": {"serverName": getattr(p, "sni", server),
+                                        "allowInsecure": False}}
                 }
-                if hasattr(p, "fingerprint"):
-                    out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fingerprint
-                if hasattr(p, "alpn"):
-                    alpn_val = p.alpn
-                    if isinstance(alpn_val, str):
-                        alpn_val = [a.strip() for a in alpn_val.split(",") if a.strip()]
-                    out["streamSettings"]["tlsSettings"]["alpn"] = alpn_val
-
-                if p.protocol == "hysteria":
-                    if hasattr(p, "up"):
-                        out["settings"]["servers"][0]["up_mbps"] = p.up
-                    if hasattr(p, "down"):
-                        out["settings"]["servers"][0]["down_mbps"] = p.down
-                    if hasattr(p, "obfs"):
-                        out["settings"]["servers"][0]["obfs"] = p.obfs
-
-                if p.protocol == "hysteria2":
-                    if hasattr(p, "obfs"):
-                        out["settings"]["servers"][0]["obfs"] = {
-                            "type": getattr(p, "obfs", "salamander")
-                        }
-                        if hasattr(p, "obfs_password"):
-                            out["settings"]["servers"][0]["obfs"]["password"] = p.obfs_password
-                        elif hasattr(p, "obfsPassword"):
-                            out["settings"]["servers"][0]["obfs"]["password"] = p.obfsPassword
-                    if hasattr(p, "congestion_control_type"):
-                        out["settings"]["servers"][0]["congestion_control_type"] = p.congestion_control_type
-                    elif hasattr(p, "congestion"):
-                        out["settings"]["servers"][0]["congestion_control_type"] = p.congestion
-                    if hasattr(p, "up"):
-                        out["settings"]["servers"][0]["up_mbps"] = p.up
-                    if hasattr(p, "down"):
-                        out["settings"]["servers"][0]["down_mbps"] = p.down
+                if getattr(p, "fp", ""):
+                    out["streamSettings"]["tlsSettings"]["fingerprint"] = p.fp
+                if getattr(p, "alpn", ""):
+                    out["streamSettings"]["tlsSettings"]["alpn"] = [a.strip() for a in p.alpn.split(",") if a.strip()]
+                if p.protocol == "hysteria2" and getattr(p, "hy2_obfs", ""):
+                    out["settings"]["servers"][0]["obfs"] = {
+                        "type": p.hy2_obfs,
+                        "password": getattr(p, "hy2_obfs_password", "")
+                    }
                 return out
 
-            # ---------- SOCKS ----------
-            if p.protocol == 'socks':
-                user = getattr(p, 'id', '') or ''
-                pwd = getattr(p, 'password', '') or ''
-                srv = {"address": server, "port": p.port}
-                if user:
-                    srv["users"] = [{"user": user, "pass": pwd}]
-                return {"protocol": "socks", "settings": {"servers": [srv]}}
-        except Exception:
+            # ----- WireGuard (manual) -----
+            if p.protocol == "wireguard":
+                reserved = []
+                if getattr(p, "wg_reserved", ""):
+                    reserved = [int(i.strip()) for i in p.wg_reserved.split(",") if i.strip()]
+                return {
+                    "protocol": "wireguard",
+                    "settings": {
+                        "secretKey": getattr(p, "wg_secret_key", ""),
+                        "address": getattr(p, "wg_address", "172.16.0.2/32").split(","),
+                        "peers": [{"publicKey": getattr(p, "pbk", ""),
+                                   "endpoint": f"{server}:{p.port}"}],
+                        "mtu": getattr(p, "wg_mtu", 1420),
+                        "reserved": reserved,
+                    }
+                }
+
             return None
-        return None
+        except Exception as e:
+            self.add_log(f"❌ Parse error: {e}")
+            return None
 
     def _test_proxy_xray(self, key: str, port: int, test_dns: bool = False) -> float | tuple | None:
         import requests
@@ -4631,11 +4457,12 @@ class DMClientsApp:
         else:
             return ft.Text(f"{ping_ms:.0f}ms", color="#F44336")
 
-    def _build_proxy_rows(self, data: list, ping_results: dict = None):
+    def _build_proxy_rows(self, keys: list, ping_results: dict = None):
+        """Build proxy table rows. `keys` is a list of proxy key strings (new format).
+        Ports are implied: 10801 + index."""
         rows = []
-        for item in data:
-            port = item["port"]
-            key = item["key"]
+        for idx, key in enumerate(keys):
+            port = self.PROXY_BASE_PORT + idx
             key_preview = key.split("#")[0][:50]
             replace_btn = ft.FilledButton("Replace", icon=ft.Icons.REFRESH,
                                           on_click=lambda e, p=port: self._replace_proxy(p), width=200,
@@ -4664,8 +4491,9 @@ class DMClientsApp:
 
         def run_fast_proxies():
             FAST_URL = "https://raw.githubusercontent.com/lothiann/DMClients/refs/heads/main/fastproxies.json"
-            N = (self.NUM_CLIENTS + self.clients_per_proxy - 1) // self.clients_per_proxy
-            self.add_log(f"⚡ Fast proxies: need {N} proxies for {self.NUM_CLIENTS} clients, {self.clients_per_proxy} per proxy")
+            # Pool size — PROXY_LIMIT (Check Proxy will later filter to ceil(NUM_CLIENTS/cpp)).
+            N = max(1, getattr(self, 'PROXY_LIMIT', 14))
+            self.add_log(f"⚡ Fast proxies: picking {N} proxies into proxies.json (pool)")
 
             # --- Load keys ---
             try:
@@ -4712,18 +4540,28 @@ class DMClientsApp:
             if len(selected) < N:
                 self.add_log(f"⚠️ Only {len(selected)} working proxies, need {N}")
 
-            proxies_list = []
+            proxies_list = [key for _, key in selected]
             for idx, (ping, key) in enumerate(selected):
-                proxies_list.append({"port": 10801 + idx, "key": key})
                 self.add_log(f"   Selected: {self._key_preview(key)} ({ping:.0f}ms) -> port {10801 + idx}")
 
             settings_dir = os.path.join(os.path.dirname(__file__), "Settings")
             os.makedirs(settings_dir, exist_ok=True)
             json_path = os.path.join(settings_dir, "proxies.json")
+            # Preserve existing settings; only replace the proxies list (new format).
+            existing = {}
+            try:
+                if os.path.exists(json_path):
+                    with open(json_path, "r", encoding="utf-8") as f:
+                        existing = json.load(f)
+            except Exception:
+                existing = {}
+            if "settings" not in existing or not isinstance(existing["settings"], dict):
+                existing["settings"] = {}
+            existing["proxies"] = proxies_list
             with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(proxies_list, f, indent=2, ensure_ascii=False)
+                json.dump(existing, f, indent=2, ensure_ascii=False)
 
-            self.add_log(f"💾 Saved {len(proxies_list)} fast proxies to {json_path}")
+            self.add_log(f"💾 Saved {len(proxies_list)} fast proxies to proxies.json")
             self._refresh_proxies_table()
 
         def run_and_unlock():
@@ -4732,6 +4570,110 @@ class DMClientsApp:
             finally:
                 e.control.disabled = False
                 self._loop.call_soon_threadsafe(e.control.update)
+        try:
+            asyncio.create_task(asyncio.to_thread(run_and_unlock))
+        except RuntimeError:
+            pass
+
+    # ========== CHECK PROXY ==========
+    def _check_proxies(self, e=None):
+        """Test all proxies in proxies.json via HTTP-through-SOCKS5 ping,
+        then save the best N = ceil(NUM_CLIENTS / clients_per_proxy) proxies
+        (sorted by ping) to checked_proxies.json.
+
+        Start Proxies (ports_proxies.py) reads checked_proxies.json — so this
+        button must be pressed before Start Proxies for proxies to launch.
+        """
+        if e:
+            e.control.disabled = True
+            e.control.update()
+
+        json_path = os.path.join(os.path.dirname(__file__), "Settings", "proxies.json")
+        if not os.path.exists(json_path):
+            if e:
+                e.control.disabled = False
+                e.control.update()
+            self.add_log("❌ proxies.json not found — run Optimal Proxies or Fast proxies first")
+            return
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as ex:
+            if e:
+                e.control.disabled = False
+                e.control.update()
+            self.add_log(f"❌ Error reading proxies.json: {ex}")
+            return
+
+        keys = data.get("proxies", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        if not keys:
+            if e:
+                e.control.disabled = False
+                e.control.update()
+            self.add_log("❌ No proxies in proxies.json — run Optimal Proxies or Fast proxies first")
+            return
+
+        cpp = max(1, self.clients_per_proxy)
+        N = (self.NUM_CLIENTS + cpp - 1) // cpp
+        self.add_log(f"🔍 Check Proxy: testing {len(keys)} proxies, will pick best {N} (clients={self.NUM_CLIENTS}, cpp={cpp})")
+
+        def _run_check():
+            # Use temporary ports 40000+i so we don't collide with already-running proxies (10801+)
+            items = [(key, 40000 + i + 1) for i, key in enumerate(keys)]
+            results = self._batch_test_proxies(items, max_workers=20, test_dns=False)
+
+            # Build (ping, key) pairs for working proxies
+            working = []
+            for i, key in enumerate(keys):
+                test_port = 40000 + i + 1
+                ping = results.get(test_port)
+                if ping is not None:
+                    working.append((ping, key))
+
+            # Sort by ping ascending (best first), take top N
+            working.sort(key=lambda x: x[0])
+            selected = working[:N] if len(working) >= N else working
+
+            if not selected:
+                self.add_log("❌ Check Proxy: no working proxies found — nothing saved to checked_proxies.json")
+                return
+
+            if len(selected) < N:
+                self.add_log(f"⚠️ Check Proxy: only {len(selected)} working proxies (need {N}) — saving what we have")
+
+            # Save to checked_proxies.json as a plain array of key strings
+            # (same format as spare_proxies.json)
+            checked_path = os.path.join(os.path.dirname(__file__), "Settings", "checked_proxies.json")
+            out = [key for _, key in selected]
+            try:
+                with open(checked_path, 'w', encoding='utf-8') as f:
+                    json.dump(out, f, indent=2, ensure_ascii=False)
+            except Exception as ex:
+                self.add_log(f"❌ Failed to save checked_proxies.json: {ex}")
+                return
+
+            self.add_log(f"✅ Check Proxy: saved {len(selected)} best proxies to checked_proxies.json")
+            for idx, (ping, key) in enumerate(selected):
+                self.add_log(f"   #{idx+1}  {ping:>6.0f}ms  {self._key_preview(key)}")
+
+            # Also refresh the proxy table with ping info
+            ping_by_port = {}
+            for idx, (ping, key) in enumerate(selected):
+                ping_by_port[self.PROXY_BASE_PORT + idx] = ping
+            try:
+                self.proxy_table.rows = self._build_proxy_rows([k for _, k in selected], ping_by_port)
+                self.proxy_table.update()
+            except Exception:
+                pass
+
+        def run_and_unlock():
+            try:
+                _run_check()
+            finally:
+                if e:
+                    e.control.disabled = False
+                    self._loop.call_soon_threadsafe(e.control.update)
         try:
             asyncio.create_task(asyncio.to_thread(run_and_unlock))
         except RuntimeError:
@@ -4748,7 +4690,7 @@ class DMClientsApp:
             if e:
                 e.control.disabled = False
                 e.control.update()
-            self.add_log("❌ proxies.json not found")
+            self.add_log("❌ proxies.json not found — run Optimal Proxies or Fast proxies first")
             return
 
         try:
@@ -4761,7 +4703,10 @@ class DMClientsApp:
             self.add_log(f"❌ Error reading proxies.json: {ex}")
             return
 
-        if not data:
+        # New format: {"settings": {...}, "proxies": [key1, key2, ...]}
+        keys = data.get("proxies", []) if isinstance(data, dict) else data
+
+        if not keys:
             if e:
                 e.control.disabled = False
                 e.control.update()
@@ -4769,17 +4714,17 @@ class DMClientsApp:
             return
 
         def _run_ping():
-            items = [(item["key"], 40000 + i + 1) for i, item in enumerate(data)]
+            items = [(key, 40000 + i + 1) for i, key in enumerate(keys)]
             results = self._batch_test_proxies(items, max_workers=20, test_dns=False)
 
             # Build port -> ping_ms mapping (results key is test_port, need real port)
-            port_to_data = {i + 1: item for i, item in enumerate(data)}
             ping_by_port = {}
-            for i, item in enumerate(data):
+            for i, key in enumerate(keys):
                 test_port = 40000 + i + 1
-                ping_by_port[item["port"]] = results.get(test_port)
+                real_port = self.PROXY_BASE_PORT + i
+                ping_by_port[real_port] = results.get(test_port)
 
-            self.proxy_table.rows = self._build_proxy_rows(data, ping_by_port)
+            self.proxy_table.rows = self._build_proxy_rows(keys, ping_by_port)
             try:
                 self.proxy_table.update()
             except Exception:
@@ -4800,15 +4745,13 @@ class DMClientsApp:
     def toggle_proxies(self, e):
         btn = e.control
         ports_running = getattr(self, 'ports_proxies_proc', None) and self.ports_proxies_proc.poll() is None
-        proxifyre_running = getattr(self, 'proxifyre_proc', None) and self.proxifyre_proc.poll() is None
-        if ports_running or proxifyre_running:
+        if ports_running:
             self.add_log("🛑 Stopping proxy services...")
             if getattr(self, 'ports_proxies_proc', None):
                 kill_process_tree(self.ports_proxies_proc.pid)
                 self.ports_proxies_proc = None
-            if getattr(self, 'proxifyre_proc', None):
-                kill_process_tree(self.proxifyre_proc.pid)
-                self.proxifyre_proc = None
+            # Tell all synced clients to drop their SOCKS5 proxy
+            self._resend_proxy_to_all_clients(disable=True)
             btn.content = ft.Text("Start proxies")
             btn.icon = ft.Icons.PLAY_ARROW
             btn.update()
@@ -4832,12 +4775,20 @@ class DMClientsApp:
                 errors='replace'
             )
             self.ports_proxies_proc = proc_ports
+
+            proxies_started_flag = {'done': False}
+
             def read_ports():
                 try:
                     for line in iter(proc_ports.stdout.readline, ''):
                         if line:
+                            stripped = line.rstrip()
                             if self.show_proxy_logs:
-                                self.add_log(f"[PortsProxies] {line.rstrip()}")
+                                self.add_log(f"[PortsProxies] {stripped}")
+                            # Wait for the "STARTED" marker before broadcasting c_proxy
+                            if not proxies_started_flag['done'] and "STARTED:" in stripped:
+                                proxies_started_flag['done'] = True
+                                self._loop.call_soon_threadsafe(self._on_proxies_started)
                 except Exception as ex:
                     self.add_log(f"[PortsProxies] Read error: {ex}")
                 finally:
@@ -4850,43 +4801,69 @@ class DMClientsApp:
                 asyncio.create_task(asyncio.to_thread(read_ports))
             except RuntimeError:
                 pass
-            proxifyre_path = os.path.join(os.path.dirname(__file__), "ProxiFyre", "ProxiFyre.exe")
-            if os.path.exists(proxifyre_path):
-                try:
-                    proc_prox = subprocess.Popen(
-                        [proxifyre_path],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        text=True, bufsize=1, encoding='utf-8',
-                        creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0, 
-                        errors='replace'
-                    )
-                    self.proxifyre_proc = proc_prox
-                    self.add_log(f"[ProxiFyre] Started (PID {proc_prox.pid})")
-                    def read_proxifyre():
-                        try:
-                            for line in iter(proc_prox.stdout.readline, ''):
-                                if line:
-                                    if self.show_proxifyre_logs:
-                                        self.add_log(f"[ProxiFyre] {line.rstrip()}")
-                        except Exception as ex:
-                            self.add_log(f"[ProxiFyre] Read error: {ex}")
-                        finally:
-                            proc_prox.stdout.close()
-                            proc_prox.wait()
-                            self.add_log(f"[ProxiFyre] Finished (code {proc_prox.returncode})")
-                            if getattr(self, 'proxifyre_proc', None) == proc_prox:
-                                self.proxifyre_proc = None
-                    try:
-                        asyncio.create_task(asyncio.to_thread(read_proxifyre))
-                    except RuntimeError:
-                        pass
-                except Exception as ex:
-                    self.add_log(f"[ProxiFyre] Start error: {ex}")
-            else:
-                self.add_log(f"❌ {proxifyre_path} not found")
             btn.content = ft.Text("Stop proxies")
             btn.icon = ft.Icons.STOP
             btn.update()
+
+    # ---------- SOCKS5 proxy (c_proxy) helpers ----------
+
+    # Base port for SOCKS5 proxies started by ports_proxies.py (first proxy = 10801).
+    PROXY_BASE_PORT = 10801
+
+    def _proxies_active(self) -> bool:
+        """True if ports_proxies.py is running."""
+        return bool(getattr(self, 'ports_proxies_proc', None) and self.ports_proxies_proc.poll() is None)
+
+    def _get_proxy_port_for_client(self, client_id: int) -> int:
+        """Map a client_id to its SOCKS5 proxy port.
+
+        Formula: 10801 + ((client_id - 1) // clients_per_proxy)
+        """
+        cpp = max(1, self.clients_per_proxy)
+        idx = (client_id - 1) // cpp
+        return self.PROXY_BASE_PORT + idx
+
+    def _send_command_to_ddnet_id(self, ddnet_id: int, command: str) -> bool:
+        """Send a console command to a single DDNet client by its ddnet_id.
+        Returns True if the command was queued for delivery."""
+        cid = self.client_to_control.get(ddnet_id)
+        if cid is None or cid not in self.control_server.clients:
+            return False
+        if self.add_semicolons:
+            command = f"; {command};"
+        results = self.control_server.send_command([cid], command)
+        return results.get(cid, False)
+
+    def _on_proxies_started(self):
+        """Called (on the main loop) once ports_proxies reports all proxies started.
+        Broadcasts c_proxy 1 <port> to every synced client."""
+        if not self._proxies_active():
+            return
+        self._resend_proxy_to_all_clients()
+
+    def _resend_proxy_to_all_clients(self, disable: bool = False):
+        """Send c_proxy to every synced DDNet client.
+
+        If disable=True -> sends "c_proxy 0" (drop SOCKS5).
+        Otherwise -> sends "c_proxy 1 127.0.0.1:<port>" using the client→port mapping.
+        """
+        if not hasattr(self, 'client_to_control'):
+            return
+        # Snapshot of currently synced client ids
+        ddnet_ids = list(self.client_to_control.keys())
+        if not ddnet_ids:
+            return
+        sent = 0
+        for ddnet_id in ddnet_ids:
+            if disable:
+                cmd = "c_proxy 0"
+            else:
+                port = self._get_proxy_port_for_client(ddnet_id)
+                cmd = f"c_proxy 1 127.0.0.1:{port}"
+            if self._send_command_to_ddnet_id(ddnet_id, cmd):
+                sent += 1
+        action = "disabled" if disable else "enabled"
+        self.add_log(f"📡 SOCKS5 {action} for {sent}/{len(ddnet_ids)} synced client(s)")
 
     def clear_logs(self):
         self._log_text.value = ""
@@ -5225,13 +5202,10 @@ def main(page: ft.Page):
         if hasattr(app, '_server_mgr'):
             app._server_mgr.stop()
         os.system("taskkill /F /IM xray.exe 2>nul")
-        os.system("taskkill /F /IM proxifyre.exe 2>nul")
         if getattr(app, 'optimal_proxies_proc', None):
             kill_process_tree(app.optimal_proxies_proc.pid)
         if getattr(app, 'ports_proxies_proc', None):
             kill_process_tree(app.ports_proxies_proc.pid)
-        if getattr(app, 'proxifyre_proc', None):
-            kill_process_tree(app.proxifyre_proc.pid)
         os._exit(0)
     page.on_close = on_close
 
@@ -5248,8 +5222,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         os.system("taskkill /F /IM xray.exe 2>nul")
-        os.system("taskkill /F /IM proxifyre.exe 2>nul")
-        os.system("taskkill /F /IM HDDNet*.exe 2>nul")
+        os.system("taskkill /F /IM DDNet.exe 2>nul")
         os.system("taskkill /F /IM flet.exe 2>nul")
         import psutil
         for proc in psutil.process_iter(['pid', 'name']):
